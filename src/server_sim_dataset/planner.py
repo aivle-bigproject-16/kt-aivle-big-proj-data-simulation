@@ -267,6 +267,11 @@ def _reserve_segments(
 
 
 def _candidate_record(rank: int, reason: str, row: dict[str, Any]) -> dict[str, Any]:
+    """reserve 후보 하나를 기록한다.
+
+    생성 단계가 이 후보로 실제 교체하려면 경로와 원본 해시가 있어야 한다. 식별자만
+    남기면 파일을 다시 찾아야 하고, 그러면 plan 에 고정한 의미가 없어진다.
+    """
     return {
         "rank": rank,
         "reason": reason,
@@ -274,6 +279,10 @@ def _candidate_record(rank: int, reason: str, row: dict[str, Any]) -> dict[str, 
         "original_battery_id": row["battery_id"],
         "original_index": row["original_index"],
         "original_stem": row["original_stem"],
+        "orig_image_relative_path": row["image_relative_path"],
+        "orig_json_relative_path": row["json_relative_path"],
+        "source_image_sha256": row["image_sha256"],
+        "source_json_sha256": row["json_sha256"],
     }
 
 

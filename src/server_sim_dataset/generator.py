@@ -9,6 +9,7 @@ import math
 import platform
 import sys
 import zipfile
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,33 @@ _AFFINE_ATTEMPTS = 4
 # 계획서 9.1: 원본 JPEG 조건을 재현할 수 없을 때 쓰는 승인된 공통 profile.
 _COMMON_JPEG_PROFILE = "common-q95-s444"
 _SOURCE_JPEG_PROFILE = "source-qtable"
+# 계획서 7.5 의 고정 재시도 횟수. 이 횟수를 모두 쓴 뒤에만 reserve 로 넘어간다.
+_FAILURE_ATTEMPTS = 8
+
+
+def _library_versions() -> dict[str, str]:
+    """계획서 7.7 이 요구하는 실행 환경 기록."""
+    versions: dict[str, str] = {}
+    for name in ("PIL", "numpy", "shapely", "psutil"):
+        try:
+            versions[name] = importlib.import_module(name).__version__
+        except Exception:
+            versions[name] = "unavailable"
+    return versions
+
+
+def _engine_provenance(engine: Any, engine_root: Path | None) -> dict[str, str]:
+    """계획서 13.3 이 요구하는 v2.0 설정과 augment.py 의 SHA-256 기록."""
+    if engine is None:
+        return {"version": "not-loaded", "augment_sha256": ""}
+    module_file = getattr(engine, "__file__", "")
+    package = sys.modules.get(engine.__name__.split(".")[0])
+    return {
+        "version": str(getattr(package, "__version__", "unknown")),
+        "augment_path": module_file,
+        "augment_sha256": sha256_file(Path(module_file)) if module_file and Path(module_file).is_file() else "",
+        "engine_root": str(engine_root) if engine_root else "",
+    }
 
 
 def _gamma(image: Image.Image, value: float) -> Image.Image:
@@ -298,91 +326,245 @@ def _labels(path_det:Path,path_seg:Path,defects:list[tuple[str,list[tuple[float,
     path_seg.write_text("\n".join(seg)+("\n" if seg else ""),encoding="utf-8")
 
 
-def generate(raw_root:Path,plan_path:Path,output:Path,engine_root:Path|None=None,limit:int|None=None,resume:bool=False)->dict[str,Any]:
+@dataclass
+class Rendered:
+    """한 소스를 읽어 정상 증강까지 끝낸 상태."""
+
+    image: Image.Image
+    payload: dict[str,Any]
+    defects: list[tuple[str,list[tuple[float,float]]]]
+    normal: NormalResult
+    outline: list[tuple[float,float]]
+    quantization: Any = None
+    subsampling: int = -1
+
+
+def _pixel_hash(image: Image.Image) -> str:
+    return hashlib.sha256(image.tobytes()).hexdigest()
+
+
+def _polygon_area(polygon: list[tuple[float,float]]) -> float:
+    total = 0.0
+    for (x1,y1),(x2,y2) in zip(polygon, polygon[1:] + polygon[:1]):
+        total += x1*y2 - x2*y1
+    return abs(total) / 2
+
+
+def _measurements(before: Image.Image, after: Image.Image, defects_before: list, defects_after: list) -> dict[str,float]:
+    """계획서 7.7 의 automatic_checks.measurements.
+
+    엔진은 severity 와 변환 파라미터만 돌려주므로 적용 전후의 실측값은 여기서 잰다.
+    """
+    first = np.asarray(before.convert("L"), dtype=np.float32)
+    second = np.asarray(after.convert("L"), dtype=np.float32)
+    area_before = sum(_polygon_area(polygon) for _,polygon in defects_before)
+    area_after = sum(_polygon_area(polygon) for _,polygon in defects_after)
+    return {
+        "mean_luminance_delta": round(float(second.mean() - first.mean()), 6),
+        "std_ratio": round(float(second.std() / first.std()) if first.std() else 0.0, 6),
+        "defect_area_retention": round(area_after / area_before, 6) if area_before else 1.0,
+    }
+
+
+def _render(raw_root: Path, row: dict[str,str], source: dict[str,Any], *, strict_source_hash: bool) -> Rendered:
+    """소스 하나를 읽어 ROI crop 과 정상 증강까지 적용한다.
+
+    reserve 로 교체하면 소스 이미지 자체가 바뀌므로 이 경로를 다시 타야 한다. 주 구간과
+    reserve 가 같은 코드를 쓰지 않으면 두 경로의 증강 결과가 어긋난다.
+    """
+    modality = row["modality"]
+    image_path = (raw_root / source["orig_image_relative_path"]).resolve()
+    json_path = (raw_root / source["orig_json_relative_path"]).resolve()
+    if raw_root not in image_path.parents or raw_root not in json_path.parents:
+        raise ValueError("Plan path escapes raw root")
+    if strict_source_hash and (
+        sha256_file(image_path) != source["source_image_sha256"]
+        or sha256_file(json_path) != source["source_json_sha256"]
+    ):
+        raise ValueError(f"Source hash mismatch: {row['sample_id']}")
+    payload = json.loads(json_path.read_text(encoding="utf-8-sig"))
+    quantization = None
+    subsampling = -1
+    with Image.open(image_path) as handle:
+        if modality == "CT" and handle.format == "JPEG":
+            # 계획서 9.1: 원본 JPEG 의 quantization table 과 subsampling 을 재사용한다.
+            quantization = getattr(handle, "quantization", None)
+            try: subsampling = JpegImagePlugin.get_sampling(handle)
+            except Exception: subsampling = -1
+        image = handle.convert("L" if modality == "CT" else "RGB")
+    offset = (0,0)
+    if modality == "CT":
+        roi = roi_bbox(payload, *image.size); offset = (roi[0], roi[1]); image = image.crop(roi)
+    names = json.loads(row["base_augmentation_names"])
+    params = json.loads(row["normal_augmentation_parameters"])
+    # 계획서 6.3 의 이동·회전 게이트는 출력 좌표계의 outline 과 defect polygon 으로 판정한다.
+    geometry = [
+        _shift(polygon, offset) for polygon in
+        [points((payload.get("swelling") or {}).get("battery_outline"))] + [p for _,p in iter_defects(payload)]
+        if polygon
+    ]
+    normal = _normal(
+        image, names, params,
+        int(row.get("slice_seed") or row["normal_augmentation_seed"]),
+        int(row["normal_augmentation_seed"]),
+        sequence=(int(row.get("source_sequence_order") or 0), sequence_length(modality, row["axis"])),
+        axis=row["axis"], geometry=geometry or None,
+    )
+    width, height = normal.image.size
+    defects = _update_annotations(
+        payload, width, height, offset=offset,
+        flip_x=normal.flip_x, flip_y=normal.flip_y, affine=normal.affine,
+    )
+    outline = points((payload.get("swelling") or {}).get("battery_outline"))
+    return Rendered(normal.image, payload, defects, normal, outline, quantization, subsampling)
+
+
+def _apply_failure(engine: Any, rendered: Rendered, row: dict[str,str]) -> dict[str,Any] | None:
+    """계획서 7.5 의 고정 재시도. 8 회 모두 실패하면 None 을 돌려 reserve 로 넘긴다.
+
+    증강 종류나 강도 범위를 임의로 완화해 통과시키지 않는다.
+    """
+    defect_polygons = [polygon for _,polygon in rendered.defects]
+    before = rendered.image
+    last_error: Exception | None = None
+    for attempt in range(_FAILURE_ATTEMPTS):
+        try:
+            result = engine.apply_failure_case(
+                before, row["modality"], row["failure_case"],
+                stable_seed(row["item_seed"], "attempt", attempt),
+                _mask(before.size, [rendered.outline]),
+                _mask(before.size, defect_polygons) if defect_polygons else None,
+            )
+        except (ValueError, RuntimeError) as exc:
+            last_error = exc
+            continue
+        # 엔진이 크기를 바꾸는 case 가 있으므로 적용 후 실제 크기를 다시 읽는다.
+        width, height = result.image.size
+        defects = _update_annotations(rendered.payload, width, height, affine=result.transform)
+        return {
+            "attempt": attempt,
+            "result": result,
+            "defects": defects,
+            "width": width,
+            "height": height,
+            "measurements": _measurements(before, result.image, rendered.defects, defects),
+        }
+    LOGGER.warning(
+        "FAIL gate exhausted %d attempts for %s: %s", _FAILURE_ATTEMPTS, row["sample_id"], last_error
+    )
+    return None
+
+
+def generate(raw_root:Path,plan_path:Path,output:Path,engine_root:Path|None=None,limit:int|None=None,resume:bool=False,strict_source_hash:bool=False)->dict[str,Any]:
     raw_root=raw_root.resolve(); output=output.resolve()
     if output.exists() and any(output.iterdir()) and not resume: raise ValueError(f"Output directory is not empty: {output}")
     with plan_path.open("r",encoding="utf-8-sig",newline="") as handle:
         rows=list(csv.DictReader(handle))
     if limit: rows=rows[:limit]
     plan_hash=sha256_file(plan_path)
-    engine=None; manifest=[]; failures=0
+    engine=None; manifest=[]; reserve_used=0; quality_gate_retries=0
     for index,row in enumerate(rows,1):
-        modality=row["modality"]; source_image=(raw_root/row["orig_image_relative_path"]).resolve(); source_json=(raw_root/row["orig_json_relative_path"]).resolve()
-        if raw_root not in source_image.parents or raw_root not in source_json.parents: raise ValueError("Plan path escapes raw root")
-        if sha256_file(source_image)!=row["source_image_sha256"] or sha256_file(source_json)!=row["source_json_sha256"]: raise ValueError(f"Source hash mismatch: {row['sample_id']}")
-        payload=json.loads(source_json.read_text(encoding="utf-8-sig"))
-        quantization=None; subsampling=-1
-        with Image.open(source_image) as source:
-            if modality=="CT" and source.format=="JPEG":
-                # 계획서 9.1: 원본 JPEG 의 quantization table 과 subsampling 을 재사용한다.
-                quantization=getattr(source,"quantization",None)
-                try: subsampling=JpegImagePlugin.get_sampling(source)
-                except Exception: subsampling=-1
-            image=source.convert("L" if modality=="CT" else "RGB")
-        offset=(0,0)
-        if modality=="CT":
-            roi=roi_bbox(payload,*image.size); offset=(roi[0],roi[1]); image=image.crop(roi)
-        names=json.loads(row["base_augmentation_names"]); params=json.loads(row["normal_augmentation_parameters"])
-        slice_seed=int(row.get("slice_seed") or row["normal_augmentation_seed"])
-        id_seed=int(row["normal_augmentation_seed"])
-        # 계획서 6.3 의 이동·회전 게이트는 출력 좌표계의 outline 과 defect polygon 으로 판정한다.
-        geometry=[_shift(polygon,offset) for polygon in
-            [points((payload.get("swelling") or {}).get("battery_outline"))]+[p for _,p in iter_defects(payload)] if polygon]
-        normal=_normal(image,names,params,slice_seed,id_seed,
-            sequence=(int(row.get("source_sequence_order") or 0),sequence_length(modality,row["axis"])),
-            axis=row["axis"],geometry=geometry or None)
-        image=normal.image; width,height=image.size
-        defects=_update_annotations(payload,width,height,offset=offset,flip_x=normal.flip_x,flip_y=normal.flip_y,affine=normal.affine)
-        augmentation={"normal_augmentations":names,"applied_augmentations":normal.applied,
-            "normal_parameters":params,"seed":id_seed,"slice_seed":slice_seed,
+        modality=row["modality"]
+        rendered=_render(raw_root,row,row,strict_source_hash=strict_source_hash)
+        normal=rendered.normal; payload=rendered.payload; defects=rendered.defects
+        image=rendered.image; width,height=image.size
+        normal_base_pixel_hash=_pixel_hash(image)
+        augmentation={"normal_augmentations":json.loads(row["base_augmentation_names"]),
+            "applied_augmentations":normal.applied,
+            "normal_parameters":json.loads(row["normal_augmentation_parameters"]),
+            "seed":int(row["normal_augmentation_seed"]),
+            "slice_seed":int(row.get("slice_seed") or row["normal_augmentation_seed"]),
             "flip":{"x":normal.flip_x,"y":normal.flip_y},"retry_reason":normal.retry_reason,
-            "failure_case":"","automatic_checks":{"passed":True}}
+            "failure_case":"","automatic_checks":{"passed":True,"measurements":{}}}
+        used_reserve:dict[str,Any]|None=None; artifact_mask_path=""
         if row["failure_case"]:
             if engine is None: engine=_failure_engine(engine_root)
-            outline=points((payload.get("swelling") or {}).get("battery_outline")); defect_polygons=[polygon for _,polygon in defects]
-            last_error=None
-            for attempt in range(8):
-                try:
-                    attempt_seed=stable_seed(row["item_seed"],"attempt",attempt)
-                    result=engine.apply_failure_case(image,modality,row["failure_case"],attempt_seed,_mask(image.size,[outline]),_mask(image.size,defect_polygons) if defect_polygons else None)
-                    augmentation["failure_attempt"]=attempt
-                    break
-                except (ValueError,RuntimeError) as exc:
-                    last_error=exc
-            else:
-                raise RuntimeError(f"FAIL quality gate exhausted 8 fixed-range attempts for {row['sample_id']}: {last_error}")
-            image=result.image; defects=_update_annotations(payload,width,height,affine=result.transform)
-            augmentation.update({"failure_case":row["failure_case"],"transforms":result.records})
+            outcome=_apply_failure(engine,rendered,row)
+            if outcome is None:
+                # 계획서 7.5: 8 회 모두 실패한 뒤에만 다음 reserve 소스로 이동한다.
+                for candidate in json.loads(row.get("reserve_candidates") or "[]"):
+                    rendered=_render(raw_root,row,candidate,strict_source_hash=strict_source_hash)
+                    outcome=_apply_failure(engine,rendered,row)
+                    if outcome is not None:
+                        used_reserve=candidate
+                        reserve_used+=1
+                        payload=rendered.payload
+                        normal_base_pixel_hash=_pixel_hash(rendered.image)
+                        LOGGER.info("Reserve rank %s used for %s (%s)",candidate["rank"],row["sample_id"],candidate["reason"])
+                        break
+                if outcome is None:
+                    raise RuntimeError(f"FAIL quality gate exhausted every reserve for {row['sample_id']}")
+            quality_gate_retries+=outcome["attempt"]
+            result=outcome["result"]; defects=outcome["defects"]
+            image=result.image; width,height=outcome["width"],outcome["height"]
+            augmentation.update({"failure_case":row["failure_case"],"failure_attempt":outcome["attempt"],
+                "transforms":result.records,
+                "severity":max((record.get("severity",0.0) for record in result.records),default=0.0),
+                "automatic_checks":{"passed":True,"measurements":outcome["measurements"]}})
+            if getattr(result,"object_mask",None) is not None:
+                mask_dir=output/row["capture_set"]/modality/"failure_masks"; mask_dir.mkdir(parents=True,exist_ok=True)
+                mask_file=mask_dir/((row.get("synthetic_id") or row["sample_id"])+".mask.png")
+                result.object_mask.save(mask_file,format="PNG")
+                artifact_mask_path=mask_file.relative_to(output).as_posix()
         stem=row.get("synthetic_id") or output_stem(row["capture_set"],modality,int(row["output_battery_id"]),row["axis"],int(row["original_index"]))
         base=output/row["capture_set"]/modality
         for folder in ("images","json","labels_det","labels_seg","augmentation_json"): (base/folder).mkdir(parents=True,exist_ok=True)
         image_path=base/"images"/(stem+(".jpg" if modality=="CT" else ".png")); json_path=base/"json"/(stem+".json"); det_path=base/"labels_det"/(stem+".txt"); seg_path=base/"labels_seg"/(stem+".txt")
         jpeg_profile=""
         if modality=="CT":
-            jpeg_profile=_save_jpeg(image,image_path,quantization,subsampling)
+            jpeg_profile=_save_jpeg(image,image_path,rendered.quantization,rendered.subsampling)
         else: image.save(image_path,format="PNG")
         info=payload.setdefault("image_info",{}); data=payload.setdefault("data_info",{}); data["battery_ids"]=int(row["output_battery_id"]); info.update({"id":stable_seed(row["sample_id"]),"file_name":image_path.name,"width":width,"height":height,"is_normal":not bool(defects)})
         if modality=="CT": data["roi"]=[0,0,width,height]
         atomic_json(json_path,payload); _labels(det_path,seg_path,defects,modality,width,height)
         augmentation["output_sha256"]=sha256_file(image_path); aug_path=base/"augmentation_json"/(stem+".augmentation.json"); atomic_json(aug_path,augmentation)
+        checks=augmentation["automatic_checks"]
+        class_counts=Counter(name for name,_ in defects)
         result_row=dict(row); result_row.update({"generation_status":"success",
             "jpeg_profile_id":jpeg_profile,"exclusion_or_retry_reason":normal.retry_reason,
             "generator_version":__version__,"plan_sha256":plan_hash,
+            "pixel_hash":_pixel_hash(image),"normal_base_pixel_hash":normal_base_pixel_hash,
+            "output_defect_count":len(defects),"class_instance_counts":json.dumps(class_counts,sort_keys=True),
+            "failure_artifact_mask_path":artifact_mask_path,
+            "failure_method_order":json.dumps([record.get("type","") for record in augmentation.get("transforms",[])]),
+            "failure_augmentation_parameters":json.dumps(augmentation.get("transforms",[]),ensure_ascii=False),
+            "quality_gate_passed":str(bool(checks["passed"])).lower(),
+            "quality_gate_metrics":json.dumps(checks["measurements"],sort_keys=True),
+            "reserve_rank":used_reserve["rank"] if used_reserve else "",
+            "reserve_reason":used_reserve["reason"] if used_reserve else "",
+            "reserve_source_split":used_reserve["source_split"] if used_reserve else "",
+            "reserve_original_battery_id":used_reserve["original_battery_id"] if used_reserve else "",
+            "reserve_original_index":used_reserve["original_index"] if used_reserve else "",
+            "reserve_original_stem":used_reserve["original_stem"] if used_reserve else "",
             "output_image_path":image_path.relative_to(output).as_posix(),"output_json_path":json_path.relative_to(output).as_posix(),"output_det_path":det_path.relative_to(output).as_posix(),"output_seg_path":seg_path.relative_to(output).as_posix(),"output_image_sha256":sha256_file(image_path),"output_json_sha256":sha256_file(json_path),"output_det_sha256":sha256_file(det_path),"output_seg_sha256":sha256_file(seg_path),"augmentation_json_path":aug_path.relative_to(output).as_posix(),"augmentation_json_sha256":sha256_file(aug_path)})
         manifest.append(result_row)
         if index%25==0 or index==len(rows):
             LOGGER.info(
-                "Generation %s/%s (%.2f%%) | failed %d",
+                "Generation %s/%s (%.2f%%) | reserve %d | retries %d",
                 f"{index:,}",
                 f"{len(rows):,}",
                 100*index/len(rows),
-                failures,
+                reserve_used,
+                quality_gate_retries,
             )
     manifests=output/"manifests"; manifests.mkdir(parents=True,exist_ok=True)
     if manifest:
         with (manifests/"dataset_manifest.csv").open("w",encoding="utf-8-sig",newline="") as handle:
             writer=csv.DictWriter(handle,fieldnames=list(manifest[0])); writer.writeheader(); writer.writerows(manifest)
-    summary={"generator_version":__version__,"planned":len(rows),"succeeded":len(manifest),"failed":failures,"python":sys.version,"platform":platform.platform(),"plan_sha256":sha256_file(plan_path),"label_source":"extracted-json-only"}; atomic_json(output/"generation_summary.json",summary); return summary
+    summary={
+        "generator_version":__version__,
+        "planned":len(rows),"succeeded":len(manifest),
+        "reserve_used":reserve_used,"quality_gate_retries":quality_gate_retries,
+        "plan_sha256":plan_hash,
+        "config_hash":rows[0].get("config_hash","") if rows else "",
+        "label_source":"extracted-json-only",
+        "python":sys.version,"platform":platform.platform(),
+        "libraries":_library_versions(),
+        "failure_engine":_engine_provenance(engine,engine_root),
+    }
+    atomic_json(output/"generation_summary.json",summary)
+    atomic_json(manifests/"generation_summary.json",summary)
+    return summary
 
 
 def verify(output:Path)->dict[str,int]:

@@ -644,11 +644,23 @@ def _sequence_metadata(
 
 
 def _configuration(seed: int) -> dict[str, Any]:
+    """결과를 바꾸는 설정 전체. 계획서 13.3 의 config_hash 재료다.
+
+    여기에 빠진 상수는 값이 바뀌어도 해시가 그대로다. v1.4 의 목표 결함률과 클래스 구성,
+    층 경계, FAIL 구간 길이가 빠져 있어 v1.3 과 v1.4 의 해시가 같게 나왔다.
+    """
     return {
         "global_seed": seed,
         "ct_counts": CT_COUNTS,
         "rgb_count": RGB_COUNT,
+        "selected_ids": SELECTED_IDS,
         "ct_porosity_limit": CT_POROSITY_LIMIT,
+        "ct_positive_rate_bins": [[name, low, high] for name, low, high in CT_POSITIVE_RATE_BINS],
+        "rgb_defect_rate": RGB_DEFECT_RATE,
+        "rgb_defect_composition": RGB_DEFECT_COMPOSITION,
+        "rgb_search_pool": RGB_SEARCH_POOL,
+        "rgb_windows_per_id": RGB_WINDOWS_PER_ID,
+        "fail_length_range": list(FAIL_LENGTH_RANGE),
         "normal_augmentations": {key: list(value) for key, value in NORMAL_AUGMENTATIONS.items()},
         "failure_cases": {key: list(value) for key, value in FAILURE_CASES.items()},
         "search_algorithm": SEARCH_ALGORITHM,

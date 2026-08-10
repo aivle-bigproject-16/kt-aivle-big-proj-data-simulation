@@ -109,8 +109,8 @@ class PipelineTests(unittest.TestCase):
             output_json = json.loads(next((output / "initial_capture" / "CT" / "json").glob("*.json")).read_text(encoding="utf-8"))
             self.assertEqual(output_json["data_info"]["roi"], [0, 0, 8, 12])
             self.assertEqual(output_json["data_info"]["battery_ids"], 1900000001)
-            self.assertEqual(verify(output), {"samples": 1, "errors": 0})
-            self.assertEqual(package_outputs(output), {"zip_files": 17})
+            self.assertEqual(verify(output), {"samples": 1, "errors": 0, "orphans": 0})
+            self.assertEqual(package_outputs(output)["zip_files"], 17)
 
     def test_stable_seed_is_reproducible(self) -> None:
         self.assertEqual(stable_seed("a", 1), stable_seed("a", 1))

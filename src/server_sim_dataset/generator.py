@@ -8,8 +8,10 @@ import logging
 import math
 import platform
 import sys
+import time
 import zipfile
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,7 +21,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, JpegImagePlugin
 
 from . import __version__
-from .schema import iter_defects, output_stem, points, roi_bbox, sequence_length
+from .schema import MANIFEST_COLUMNS, iter_defects, output_stem, points, roi_bbox, sequence_length
 from .util import atomic_json, sha256_file, stable_seed
 
 
@@ -455,148 +457,380 @@ def _apply_failure(engine: Any, rendered: Rendered, row: dict[str,str]) -> dict[
     return None
 
 
-def generate(raw_root:Path,plan_path:Path,output:Path,engine_root:Path|None=None,limit:int|None=None,resume:bool=False,strict_source_hash:bool=False)->dict[str,Any]:
-    raw_root=raw_root.resolve(); output=output.resolve()
-    if output.exists() and any(output.iterdir()) and not resume: raise ValueError(f"Output directory is not empty: {output}")
-    with plan_path.open("r",encoding="utf-8-sig",newline="") as handle:
-        rows=list(csv.DictReader(handle))
-    if limit: rows=rows[:limit]
-    plan_hash=sha256_file(plan_path)
-    engine=None; manifest=[]; reserve_used=0; quality_gate_retries=0
-    for index,row in enumerate(rows,1):
-        modality=row["modality"]
-        rendered=_render(raw_root,row,row,strict_source_hash=strict_source_hash)
-        normal=rendered.normal; payload=rendered.payload; defects=rendered.defects
-        image=rendered.image; width,height=image.size
-        normal_base_pixel_hash=_pixel_hash(image)
-        augmentation={"normal_augmentations":json.loads(row["base_augmentation_names"]),
-            "applied_augmentations":normal.applied,
-            "normal_parameters":json.loads(row["normal_augmentation_parameters"]),
-            "seed":int(row["normal_augmentation_seed"]),
-            "slice_seed":int(row.get("slice_seed") or row["normal_augmentation_seed"]),
-            "flip":{"x":normal.flip_x,"y":normal.flip_y},"retry_reason":normal.retry_reason,
-            "failure_case":"","automatic_checks":{"passed":True,"measurements":{}}}
-        used_reserve:dict[str,Any]|None=None; artifact_mask_path=""
-        if row["failure_case"]:
-            if engine is None: engine=_failure_engine(engine_root)
-            outcome=_apply_failure(engine,rendered,row)
-            if outcome is None:
-                # 계획서 7.5: 8 회 모두 실패한 뒤에만 다음 reserve 소스로 이동한다.
-                for candidate in json.loads(row.get("reserve_candidates") or "[]"):
-                    rendered=_render(raw_root,row,candidate,strict_source_hash=strict_source_hash)
-                    outcome=_apply_failure(engine,rendered,row)
-                    if outcome is not None:
-                        used_reserve=candidate
-                        reserve_used+=1
-                        payload=rendered.payload
-                        normal_base_pixel_hash=_pixel_hash(rendered.image)
-                        LOGGER.info("Reserve rank %s used for %s (%s)",candidate["rank"],row["sample_id"],candidate["reason"])
-                        break
-                if outcome is None:
-                    raise RuntimeError(f"FAIL quality gate exhausted every reserve for {row['sample_id']}")
-            quality_gate_retries+=outcome["attempt"]
-            result=outcome["result"]; defects=outcome["defects"]
-            image=result.image; width,height=outcome["width"],outcome["height"]
-            augmentation.update({"failure_case":row["failure_case"],"failure_attempt":outcome["attempt"],
-                "transforms":result.records,
-                "severity":max((record.get("severity",0.0) for record in result.records),default=0.0),
-                "automatic_checks":{"passed":True,"measurements":outcome["measurements"]}})
-            if getattr(result,"object_mask",None) is not None:
-                mask_dir=output/row["capture_set"]/modality/"failure_masks"; mask_dir.mkdir(parents=True,exist_ok=True)
-                mask_file=mask_dir/((row.get("synthetic_id") or row["sample_id"])+".mask.png")
-                result.object_mask.save(mask_file,format="PNG")
-                artifact_mask_path=mask_file.relative_to(output).as_posix()
-        stem=row.get("synthetic_id") or output_stem(row["capture_set"],modality,int(row["output_battery_id"]),row["axis"],int(row["original_index"]))
-        base=output/row["capture_set"]/modality
-        for folder in ("images","json","labels_det","labels_seg","augmentation_json"): (base/folder).mkdir(parents=True,exist_ok=True)
-        image_path=base/"images"/(stem+(".jpg" if modality=="CT" else ".png")); json_path=base/"json"/(stem+".json"); det_path=base/"labels_det"/(stem+".txt"); seg_path=base/"labels_seg"/(stem+".txt")
-        jpeg_profile=""
-        if modality=="CT":
-            jpeg_profile=_save_jpeg(image,image_path,rendered.quantization,rendered.subsampling)
-        else: image.save(image_path,format="PNG")
-        info=payload.setdefault("image_info",{}); data=payload.setdefault("data_info",{}); data["battery_ids"]=int(row["output_battery_id"]); info.update({"id":stable_seed(row["sample_id"]),"file_name":image_path.name,"width":width,"height":height,"is_normal":not bool(defects)})
-        if modality=="CT": data["roi"]=[0,0,width,height]
-        atomic_json(json_path,payload); _labels(det_path,seg_path,defects,modality,width,height)
-        augmentation["output_sha256"]=sha256_file(image_path); aug_path=base/"augmentation_json"/(stem+".augmentation.json"); atomic_json(aug_path,augmentation)
-        checks=augmentation["automatic_checks"]
-        class_counts=Counter(name for name,_ in defects)
-        result_row=dict(row); result_row.update({"generation_status":"success",
-            "jpeg_profile_id":jpeg_profile,"exclusion_or_retry_reason":normal.retry_reason,
-            "generator_version":__version__,"plan_sha256":plan_hash,
-            "pixel_hash":_pixel_hash(image),"normal_base_pixel_hash":normal_base_pixel_hash,
-            "output_defect_count":len(defects),"class_instance_counts":json.dumps(class_counts,sort_keys=True),
-            "failure_artifact_mask_path":artifact_mask_path,
-            "failure_method_order":json.dumps([record.get("type","") for record in augmentation.get("transforms",[])]),
-            "failure_augmentation_parameters":json.dumps(augmentation.get("transforms",[]),ensure_ascii=False),
-            "quality_gate_passed":str(bool(checks["passed"])).lower(),
-            "quality_gate_metrics":json.dumps(checks["measurements"],sort_keys=True),
-            "reserve_rank":used_reserve["rank"] if used_reserve else "",
-            "reserve_reason":used_reserve["reason"] if used_reserve else "",
-            "reserve_source_split":used_reserve["source_split"] if used_reserve else "",
-            "reserve_original_battery_id":used_reserve["original_battery_id"] if used_reserve else "",
-            "reserve_original_index":used_reserve["original_index"] if used_reserve else "",
-            "reserve_original_stem":used_reserve["original_stem"] if used_reserve else "",
-            "output_image_path":image_path.relative_to(output).as_posix(),"output_json_path":json_path.relative_to(output).as_posix(),"output_det_path":det_path.relative_to(output).as_posix(),"output_seg_path":seg_path.relative_to(output).as_posix(),"output_image_sha256":sha256_file(image_path),"output_json_sha256":sha256_file(json_path),"output_det_sha256":sha256_file(det_path),"output_seg_sha256":sha256_file(seg_path),"augmentation_json_path":aug_path.relative_to(output).as_posix(),"augmentation_json_sha256":sha256_file(aug_path)})
-        manifest.append(result_row)
-        if index%25==0 or index==len(rows):
-            LOGGER.info(
-                "Generation %s/%s (%.2f%%) | reserve %d | retries %d",
-                f"{index:,}",
-                f"{len(rows):,}",
-                100*index/len(rows),
-                reserve_used,
-                quality_gate_retries,
-            )
-    manifests=output/"manifests"; manifests.mkdir(parents=True,exist_ok=True)
-    if manifest:
-        with (manifests/"dataset_manifest.csv").open("w",encoding="utf-8-sig",newline="") as handle:
-            writer=csv.DictWriter(handle,fieldnames=list(manifest[0])); writer.writeheader(); writer.writerows(manifest)
-    summary={
-        "generator_version":__version__,
-        "planned":len(rows),"succeeded":len(manifest),
-        "reserve_used":reserve_used,"quality_gate_retries":quality_gate_retries,
-        "plan_sha256":plan_hash,
-        "config_hash":rows[0].get("config_hash","") if rows else "",
-        "label_source":"extracted-json-only",
-        "python":sys.version,"platform":platform.platform(),
-        "libraries":_library_versions(),
-        "failure_engine":_engine_provenance(engine,engine_root),
+def _completed(output: Path) -> dict[str, dict[str, str]]:
+    """이미 만들어져 검증까지 통과한 행을 돌려준다.
+
+    v1.2 의 --resume 은 빈 디렉터리 검사만 껐고 실제로는 전량을 다시 만들면서 manifest 를
+    덮어썼다. 이름과 동작이 어긋나 위험했다. 여기서는 출력 4 종이 모두 존재하고 해시가
+    일치하는 행만 재사용한다.
+    """
+    manifest_path = output / "manifests" / "dataset_manifest.csv"
+    if not manifest_path.is_file():
+        return {}
+    with manifest_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    usable: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if row.get("generation_status") != "success":
+            continue
+        for column, digest in (
+            ("output_image_path", "output_image_sha256"), ("output_json_path", "output_json_sha256"),
+            ("output_det_path", "output_det_sha256"), ("output_seg_path", "output_seg_sha256"),
+        ):
+            path = output / row[column]
+            if not path.is_file() or sha256_file(path) != row[digest]:
+                break
+        else:
+            usable[row["sample_id"]] = row
+    return usable
+
+
+_WORKER_ENGINE: Any = None
+
+
+def _engine_for(engine_root: Path | None) -> Any:
+    """프로세스마다 엔진을 한 번만 import 한다."""
+    global _WORKER_ENGINE
+    if _WORKER_ENGINE is None:
+        _WORKER_ENGINE = _failure_engine(engine_root)
+    return _WORKER_ENGINE
+
+
+def _generate_one(task: tuple[Any, ...]) -> tuple[dict[str, Any], int, int]:
+    """plan 행 하나를 산출물로 만든다.
+
+    프로세스 풀에서 실행하므로 모듈 최상위에 둔다. 행끼리 상태를 공유하지 않고 seed 가
+    전부 plan 에 박혀 있으므로 병렬로 돌려도 결과는 같다.
+    """
+    raw_root, output, row, plan_hash, engine_root, strict_source_hash = task
+    modality = row["modality"]
+    rendered = _render(raw_root, row, row, strict_source_hash=strict_source_hash)
+    normal = rendered.normal
+    payload = rendered.payload
+    defects = rendered.defects
+    image = rendered.image
+    width, height = image.size
+    normal_base_pixel_hash = _pixel_hash(image)
+    augmentation = {
+        "normal_augmentations": json.loads(row["base_augmentation_names"]),
+        "applied_augmentations": normal.applied,
+        "normal_parameters": json.loads(row["normal_augmentation_parameters"]),
+        "seed": int(row["normal_augmentation_seed"]),
+        "slice_seed": int(row.get("slice_seed") or row["normal_augmentation_seed"]),
+        "flip": {"x": normal.flip_x, "y": normal.flip_y},
+        "retry_reason": normal.retry_reason,
+        "failure_case": "",
+        "automatic_checks": {"passed": True, "measurements": {}},
     }
-    atomic_json(output/"generation_summary.json",summary)
-    atomic_json(manifests/"generation_summary.json",summary)
+    used_reserve: dict[str, Any] | None = None
+    artifact_mask_path = ""
+    reserve_hit = 0
+    retries = 0
+    if row["failure_case"]:
+        engine = _engine_for(engine_root)
+        outcome = _apply_failure(engine, rendered, row)
+        if outcome is None:
+            # 계획서 7.5: 8 회 모두 실패한 뒤에만 다음 reserve 소스로 이동한다.
+            for candidate in json.loads(row.get("reserve_candidates") or "[]"):
+                rendered = _render(raw_root, row, candidate, strict_source_hash=strict_source_hash)
+                outcome = _apply_failure(engine, rendered, row)
+                if outcome is not None:
+                    used_reserve = candidate
+                    reserve_hit = 1
+                    payload = rendered.payload
+                    normal_base_pixel_hash = _pixel_hash(rendered.image)
+                    LOGGER.info(
+                        "Reserve rank %s used for %s (%s)",
+                        candidate["rank"], row["sample_id"], candidate["reason"],
+                    )
+                    break
+            if outcome is None:
+                raise RuntimeError(f"FAIL quality gate exhausted every reserve for {row['sample_id']}")
+        retries = outcome["attempt"]
+        result = outcome["result"]
+        defects = outcome["defects"]
+        image = result.image
+        width, height = outcome["width"], outcome["height"]
+        augmentation.update({
+            "failure_case": row["failure_case"],
+            "failure_attempt": outcome["attempt"],
+            "transforms": result.records,
+            "severity": max((record.get("severity", 0.0) for record in result.records), default=0.0),
+            "automatic_checks": {"passed": True, "measurements": outcome["measurements"]},
+        })
+        if getattr(result, "object_mask", None) is not None:
+            mask_dir = output / row["capture_set"] / modality / "failure_masks"
+            mask_dir.mkdir(parents=True, exist_ok=True)
+            mask_file = mask_dir / ((row.get("synthetic_id") or row["sample_id"]) + ".mask.png")
+            result.object_mask.save(mask_file, format="PNG")
+            artifact_mask_path = mask_file.relative_to(output).as_posix()
+
+    stem = row.get("synthetic_id") or output_stem(
+        row["capture_set"], modality, int(row["output_battery_id"]), row["axis"], int(row["original_index"])
+    )
+    base = output / row["capture_set"] / modality
+    for folder in ("images", "json", "labels_det", "labels_seg", "augmentation_json"):
+        (base / folder).mkdir(parents=True, exist_ok=True)
+    image_path = base / "images" / (stem + (".jpg" if modality == "CT" else ".png"))
+    json_path = base / "json" / (stem + ".json")
+    det_path = base / "labels_det" / (stem + ".txt")
+    seg_path = base / "labels_seg" / (stem + ".txt")
+    jpeg_profile = ""
+    if modality == "CT":
+        jpeg_profile = _save_jpeg(image, image_path, rendered.quantization, rendered.subsampling)
+    else:
+        image.save(image_path, format="PNG")
+    info = payload.setdefault("image_info", {})
+    data = payload.setdefault("data_info", {})
+    data["battery_ids"] = int(row["output_battery_id"])
+    info.update({
+        "id": stable_seed(row["sample_id"]), "file_name": image_path.name,
+        "width": width, "height": height, "is_normal": not bool(defects),
+    })
+    if modality == "CT":
+        data["roi"] = [0, 0, width, height]
+    atomic_json(json_path, payload)
+    _labels(det_path, seg_path, defects, modality, width, height)
+    output_image_sha = sha256_file(image_path)
+    augmentation["output_sha256"] = output_image_sha
+    aug_path = base / "augmentation_json" / (stem + ".augmentation.json")
+    atomic_json(aug_path, augmentation)
+    checks = augmentation["automatic_checks"]
+    transforms = augmentation.get("transforms", [])
+    result_row = dict(row)
+    result_row.update({
+        "generation_status": "success",
+        "jpeg_profile_id": jpeg_profile,
+        "exclusion_or_retry_reason": normal.retry_reason,
+        "generator_version": __version__,
+        "plan_sha256": plan_hash,
+        "pixel_hash": _pixel_hash(image),
+        "normal_base_pixel_hash": normal_base_pixel_hash,
+        "output_defect_count": len(defects),
+        "class_instance_counts": json.dumps(Counter(name for name, _ in defects), sort_keys=True),
+        "failure_artifact_mask_path": artifact_mask_path,
+        "failure_method_order": json.dumps([record.get("type", "") for record in transforms]),
+        "failure_augmentation_parameters": json.dumps(transforms, ensure_ascii=False),
+        "quality_gate_passed": str(bool(checks["passed"])).lower(),
+        "quality_gate_metrics": json.dumps(checks["measurements"], sort_keys=True),
+        "reserve_rank": used_reserve["rank"] if used_reserve else "",
+        "reserve_reason": used_reserve["reason"] if used_reserve else "",
+        "reserve_source_split": used_reserve["source_split"] if used_reserve else "",
+        "reserve_original_battery_id": used_reserve["original_battery_id"] if used_reserve else "",
+        "reserve_original_index": used_reserve["original_index"] if used_reserve else "",
+        "reserve_original_stem": used_reserve["original_stem"] if used_reserve else "",
+        "output_image_path": image_path.relative_to(output).as_posix(),
+        "output_json_path": json_path.relative_to(output).as_posix(),
+        "output_det_path": det_path.relative_to(output).as_posix(),
+        "output_seg_path": seg_path.relative_to(output).as_posix(),
+        "output_image_sha256": output_image_sha,
+        "output_json_sha256": sha256_file(json_path),
+        "output_det_sha256": sha256_file(det_path),
+        "output_seg_sha256": sha256_file(seg_path),
+        "augmentation_json_path": aug_path.relative_to(output).as_posix(),
+        "augmentation_json_sha256": sha256_file(aug_path),
+    })
+    return result_row, reserve_hit, retries
+
+
+def generate(
+    raw_root: Path,
+    plan_path: Path,
+    output: Path,
+    engine_root: Path | None = None,
+    limit: int | None = None,
+    resume: bool = False,
+    strict_source_hash: bool = False,
+    workers: int = 1,
+) -> dict[str, Any]:
+    raw_root = raw_root.resolve()
+    output = output.resolve()
+    if output.exists() and any(output.iterdir()) and not resume:
+        raise ValueError(f"Output directory is not empty: {output}")
+    with plan_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if limit:
+        rows = rows[:limit]
+    plan_hash = sha256_file(plan_path)
+    done: dict[str, dict[str, str]] = {}
+    if resume:
+        done = _completed(output)
+        if done:
+            LOGGER.info("Resuming: %s rows already verified", f"{len(done):,}")
+    pending = [row for row in rows if row["sample_id"] not in done]
+    tasks = [
+        (raw_root, output, row, plan_hash, engine_root, strict_source_hash)
+        for row in pending
+    ]
+    produced: list[dict[str, Any]] = []
+    reserve_used = 0
+    quality_gate_retries = 0
+    if workers > 1 and tasks:
+        pool = ProcessPoolExecutor(max_workers=workers)
+        # map 은 입력 순서를 유지하므로 병렬로 돌려도 manifest 순서가 결정론적이다.
+        results = pool.map(_generate_one, tasks, chunksize=8)
+    else:
+        pool = None
+        results = map(_generate_one, tasks)
+    started = time.perf_counter()
+    try:
+        for index, (result_row, reserve_hit, retries) in enumerate(results, 1):
+            produced.append(result_row)
+            reserve_used += reserve_hit
+            quality_gate_retries += retries
+            if index % 200 == 0 or index == len(tasks):
+                rate = index / max(1e-9, time.perf_counter() - started)
+                LOGGER.info(
+                    "Generation %s/%s (%.2f%%) | %.1f img/s | eta %.1f min | reserve %d | retries %d",
+                    f"{index:,}", f"{len(tasks):,}", 100 * index / len(tasks),
+                    rate, (len(tasks) - index) / rate / 60, reserve_used, quality_gate_retries,
+                )
+    finally:
+        if pool is not None:
+            pool.shutdown()
+    manifest = [done[row["sample_id"]] if row["sample_id"] in done else None for row in rows]
+    iterator = iter(produced)
+    manifest = [item if item is not None else next(iterator) for item in manifest]
+    manifests = output / "manifests"
+    manifests.mkdir(parents=True, exist_ok=True)
+    if manifest:
+        with (manifests / "dataset_manifest.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(MANIFEST_COLUMNS))
+            writer.writeheader()
+            writer.writerows(manifest)
+    summary = {
+        "generator_version": __version__,
+        "planned": len(rows),
+        "succeeded": len(manifest),
+        "regenerated": len(produced),
+        "reused": len(rows) - len(produced),
+        "reserve_used": reserve_used,
+        "quality_gate_retries": quality_gate_retries,
+        "workers": workers,
+        "plan_sha256": plan_hash,
+        "config_hash": rows[0].get("config_hash", "") if rows else "",
+        "label_source": "extracted-json-only",
+        "python": sys.version,
+        "platform": platform.platform(),
+        "libraries": _library_versions(),
+        "failure_engine": _engine_provenance(_WORKER_ENGINE, engine_root),
+    }
+    atomic_json(output / "generation_summary.json", summary)
+    atomic_json(manifests / "generation_summary.json", summary)
     return summary
 
 
-def verify(output:Path)->dict[str,int]:
+EXPECTED_QUANTITIES = {
+    ("initial_capture", "CT"): 29000, ("initial_capture", "RGB"): 5000,
+    ("recapture", "CT"): 2900, ("recapture", "RGB"): 500,
+}
+
+
+def verify(output:Path,plan_path:Path|None=None,expect_full:bool=False)->dict[str,int]:
+    """계획서 13.1 과 13.5 의 검증.
+
+    v1.2 의 verify 는 manifest 에 적힌 행만 순회했다. 생성이 중도에 끊겨 manifest 가
+    짧아진 산출물도 그대로 통과한다. 계획 대비 수량과 orphan 파일, 출력 JSON 과 실제
+    이미지의 일치까지 본다.
+    """
     manifest_path=output/"manifests"/"dataset_manifest.csv"
     with manifest_path.open("r",encoding="utf-8-sig",newline="") as handle:
         rows=list(csv.DictReader(handle))
-    errors=[]
+    errors:list[str]=[]
+    expected_paths:set[str]=set()
     for row in rows:
         for column,hash_column in (("output_image_path","output_image_sha256"),("output_json_path","output_json_sha256"),("output_det_path","output_det_sha256"),("output_seg_path","output_seg_sha256")):
             path=output/row[column]
+            expected_paths.add(row[column])
             if not path.is_file() or sha256_file(path)!=row[hash_column]: errors.append(f"{row['sample_id']}:{column}")
+        payload=json.loads((output/row["output_json_path"]).read_text(encoding="utf-8-sig")) if (output/row["output_json_path"]).is_file() else {}
+        info=payload.get("image_info") or {}
+        image_file=output/row["output_image_path"]
+        if image_file.is_file():
+            with Image.open(image_file) as handle_image:
+                actual=handle_image.size
+            if (info.get("width"),info.get("height"))!=actual:
+                errors.append(f"{row['sample_id']}:json-size {info.get('width')}x{info.get('height')} != {actual[0]}x{actual[1]}")
+            if info.get("file_name")!=image_file.name:
+                errors.append(f"{row['sample_id']}:json-file-name")
+            if row["modality"]=="CT" and (payload.get("data_info") or {}).get("roi")!=[0,0,actual[0],actual[1]]:
+                errors.append(f"{row['sample_id']}:json-roi")
+    if plan_path is not None:
+        with plan_path.open("r",encoding="utf-8-sig",newline="") as handle:
+            planned=sum(1 for _ in csv.DictReader(handle))
+        if planned!=len(rows): errors.append(f"plan rows {planned} != manifest rows {len(rows)}")
+    if expect_full:
+        counts=Counter((row["capture_set"],row["modality"]) for row in rows)
+        for key,expected in EXPECTED_QUANTITIES.items():
+            if counts.get(key,0)!=expected:
+                errors.append(f"quantity {key}: {counts.get(key,0)} != {expected}")
+    produced:set[str]=set()
+    for folder in ("images","json","labels_det","labels_seg"):
+        for candidate in output.glob(f"*/*/{folder}/*"):
+            if candidate.is_file(): produced.add(candidate.relative_to(output).as_posix())
+    orphans=sorted(produced-expected_paths)
+    if orphans: errors.append(f"orphan outputs {len(orphans)}: {orphans[:3]}")
     if errors: raise ValueError(f"Verification failed ({len(errors)}): {errors[:5]}")
-    return {"samples":len(rows),"errors":0}
+    return {"samples":len(rows),"errors":0,"orphans":0}
 
 
-def package_outputs(output: Path) -> dict[str, int]:
-    verify(output)
+def package_outputs(
+    output: Path,
+    plan_dir: Path | None = None,
+    cache_path: Path | None = None,
+    feasibility: Path | None = None,
+    expect_full: bool = False,
+) -> dict[str, int]:
+    """계획서 10 의 17 개 ZIP 을 만든다.
+
+    압축 전에 요약 파일을 먼저 생성하고, 압축 후에는 각 아카이브를 다시 열어 파일 수와
+    stem 집합을 대조한다. 계획서 10 이 "ZIP 생성 후 각 ZIP 내부에서도 pair 와 파일 수를
+    재검증한다"고 규정하는데 v1.2 에는 이 단계가 없었다.
+    """
+    plan_path = plan_dir / "generation_plan.csv" if plan_dir else None
+    verify(output, plan_path if plan_path and plan_path.is_file() else None, expect_full)
+    if plan_dir is not None and cache_path is not None:
+        from .reports import build_reports
+        build_reports(output, plan_dir, cache_path, feasibility)
+
+    expected: dict[str, set[str]] = {}
     zip_count = 0
-    mapping = {"images": "images", "json": "json", "labels_det": "labels_det", "labels_seg": "labels_seg"}
     for capture_set, prefix in (("initial_capture", "initial"), ("recapture", "recapture")):
         for modality in ("CT", "RGB"):
-            for folder, suffix in mapping.items():
+            for folder in ("images", "json", "labels_det", "labels_seg"):
                 source = output / capture_set / modality / folder
-                archive = output / f"{prefix}_{modality}_{suffix}.zip"
+                archive = output / f"{prefix}_{modality}_{folder}.zip"
+                names: set[str] = set()
                 with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as handle:
                     for path in sorted(source.glob("*")):
                         if path.is_file():
                             handle.write(path, path.name)
+                            names.add(path.stem)
+                expected[archive.name] = names
                 zip_count += 1
+
     with zipfile.ZipFile(output / "manifests.zip", "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as handle:
         for path in sorted((output / "manifests").glob("*")):
             if path.is_file():
                 handle.write(path, path.name)
+        # 계획서 7.7 의 추적성 산출물. v1.2 는 만들고도 어느 ZIP 에도 넣지 않아
+        # manifest 가 참조하는 파일이 배포본에 없었다.
+        for path in sorted(output.glob("*/*/augmentation_json/*.json")):
+            handle.write(path, f"augmentation_json/{path.name}")
+        for path in sorted(output.glob("*/*/failure_masks/*.png")):
+            handle.write(path, f"failure_masks/{path.name}")
     zip_count += 1
-    return {"zip_files": zip_count}
+
+    mismatches = []
+    for capture_set, prefix in (("initial_capture", "initial"), ("recapture", "recapture")):
+        for modality in ("CT", "RGB"):
+            stems = [expected[f"{prefix}_{modality}_{folder}.zip"] for folder in ("images", "json", "labels_det", "labels_seg")]
+            if len({frozenset(item) for item in stems}) != 1:
+                mismatches.append(f"{prefix}_{modality}: image/json/det/seg stem sets differ")
+    for name, names in expected.items():
+        with zipfile.ZipFile(output / name) as handle:
+            if len(handle.namelist()) != len(names):
+                mismatches.append(f"{name}: archive holds {len(handle.namelist())} of {len(names)}")
+    if mismatches:
+        raise ValueError(f"ZIP verification failed: {mismatches[:5]}")
+    return {"zip_files": zip_count, "archives_verified": len(expected) + 1}

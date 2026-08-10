@@ -6,6 +6,7 @@ import logging
 import os
 import sqlite3
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
@@ -73,7 +74,74 @@ def cache_is_usable(cache_path: Path, raw_root: Path) -> bool:
         return False
 
 
-def build_cache(raw_root: Path, cache_path: Path) -> dict[str, int]:
+def _scan_pair(task: tuple[str, str, str]) -> tuple[bool, list[object]]:
+    """JSON 하나와 짝 이미지를 읽어 pairs 행 하나를 만든다.
+
+    프로세스 풀에서 실행하므로 모듈 최상위에 두고 인자와 반환값을 모두 picklable 하게
+    유지한다. 원본 이미지 27 만 장의 SHA-256 이 스캔 시간을 지배하므로 이 함수를
+    병렬로 돌리는 것이 전체 소요를 결정한다.
+    """
+    raw_root, json_text, image_text = Path(task[0]), Path(task[1]), task[2]
+    try:
+        parsed = parse_stem(json_text.stem)
+        if not image_text:
+            raise ValueError("same-split paired image not found")
+        image_path = Path(image_text)
+        payload = json.loads(json_text.read_text(encoding="utf-8-sig"))
+        info = payload.get("image_info") or {}
+        data = payload.get("data_info") or {}
+        if int(data.get("battery_ids")) != parsed.battery_id:
+            raise ValueError("battery ID mismatch")
+        if Path(str(info.get("file_name", ""))).stem != json_text.stem:
+            raise ValueError("image_info.file_name mismatch")
+        with Image.open(image_path) as image:
+            width, height = image.size
+        roi = roi_bbox(payload, width, height) if parsed.modality == "CT" else (0, 0, width, height)
+        outline = points((payload.get("swelling") or {}).get("battery_outline"))
+        if len(outline) < 3:
+            raise ValueError("missing battery outline")
+        defects = [{"name": name, "points": polygon} for name, polygon in iter_defects(payload)]
+        names = {item["name"] for item in defects}
+        ratios = []
+        roi_width, roi_height = roi[2] - roi[0], roi[3] - roi[1]
+        for item in defects:
+            if item["name"].lower() == "porosity":
+                xs = [p[0] for p in item["points"]]; ys = [p[1] for p in item["points"]]
+                ratios.append(max((max(xs)-min(xs))/roi_width, (max(ys)-min(ys))/roi_height))
+        declared_normal = bool(info.get("is_normal"))
+        recognized = any(name.lower() in {"porosity", "damaged", "pollution"} for name in names)
+        if declared_normal == recognized:
+            raise ValueError("image_info.is_normal conflicts with defects")
+        try:
+            original_image_id = int(info.get("id"))
+        except (TypeError, ValueError):
+            original_image_id = -1
+        lowered = {name.lower() for name in names}
+        return True, ["valid", "", split_name(json_text), parsed.modality, parsed.battery_id, parsed.axis,
+            parsed.original_index, json_text.stem, safe_relative(raw_root, image_path), safe_relative(raw_root, json_text),
+            sha256_file(image_path), sha256_file(json_text), width, height, json.dumps(roi), json.dumps(outline),
+            json.dumps(defects), int(declared_normal), max(ratios, default=0.0), int("porosity" in lowered),
+            int("damaged" in lowered), int("pollution" in lowered),
+            original_image_id, json.dumps(data.get("roi")), len(defects)]
+    except Exception as exc:
+        try:
+            parsed = parse_stem(json_text.stem)
+            modality, battery, axis, original_index = parsed.modality, parsed.battery_id, parsed.axis, parsed.original_index
+        except ValueError:
+            modality, battery, axis, original_index = "", -1, "", -1
+        return False, ["invalid", str(exc), split_name(json_text), modality, battery, axis, original_index,
+            json_text.stem, "", safe_relative(raw_root, json_text), "", sha256_file(json_text), 0, 0,
+            "[]", "[]", "[]", 1, 0.0, 0, 0, 0, -1, "null", 0]
+
+
+def _tasks(raw_root: Path, image_index: dict[str, list[Path]]) -> Iterator[tuple[str, str, str]]:
+    for json_path in _files(raw_root, {".json"}):
+        json_split = split_name(json_path)
+        candidates = [path for path in image_index.get(json_path.stem, []) if split_name(path) == json_split]
+        yield str(raw_root), str(json_path), str(candidates[0]) if len(candidates) == 1 else ""
+
+
+def build_cache(raw_root: Path, cache_path: Path, workers: int = 1) -> dict[str, int]:
     raw_root = raw_root.resolve()
     if not raw_root.is_dir():
         raise FileNotFoundError(f"Raw root not found: {raw_root}")
@@ -94,84 +162,43 @@ def build_cache(raw_root: Path, cache_path: Path) -> dict[str, int]:
     ])
     counts = defaultdict(int)
     insert = "INSERT INTO pairs(status,exclusion_reason,source_split,modality,battery_id,axis,original_index,original_stem,image_relative_path,json_relative_path,image_sha256,json_sha256,width,height,roi_json,outline_json,defects_json,original_is_normal,porosity_bbox_max_ratio,has_porosity,has_damaged,has_pollution,original_image_id,original_roi_json,defect_count) VALUES(" + ",".join("?" * 25) + ")"
-    LOGGER.info("JSON-only scan: parsing extracted JSON files")
-    for index, json_path in enumerate(_files(raw_root, {".json"}), 1):
-        counts["json_seen"] += 1
-        values: list[object]
-        try:
-            parsed = parse_stem(json_path.stem)
-            json_split = split_name(json_path)
-            candidates = [path for path in image_index.get(json_path.stem, []) if split_name(path) == json_split]
-            if len(candidates) != 1:
-                raise ValueError(f"same-split paired image count={len(candidates)}")
-            image_path = candidates[0]
-            payload = json.loads(json_path.read_text(encoding="utf-8-sig"))
-            info = payload.get("image_info") or {}
-            data = payload.get("data_info") or {}
-            if int(data.get("battery_ids")) != parsed.battery_id:
-                raise ValueError("battery ID mismatch")
-            if Path(str(info.get("file_name", ""))).stem != json_path.stem:
-                raise ValueError("image_info.file_name mismatch")
-            with Image.open(image_path) as image:
-                width, height = image.size
-            roi = roi_bbox(payload, width, height) if parsed.modality == "CT" else (0, 0, width, height)
-            outline = points((payload.get("swelling") or {}).get("battery_outline"))
-            if len(outline) < 3:
-                raise ValueError("missing battery outline")
-            defects = [{"name": name, "points": polygon} for name, polygon in iter_defects(payload)]
-            names = {item["name"] for item in defects}
-            ratios = []
-            roi_width, roi_height = roi[2] - roi[0], roi[3] - roi[1]
-            for item in defects:
-                if item["name"].lower() == "porosity":
-                    xs = [p[0] for p in item["points"]]; ys = [p[1] for p in item["points"]]
-                    ratios.append(max((max(xs)-min(xs))/roi_width, (max(ys)-min(ys))/roi_height))
-            declared_normal = bool(info.get("is_normal"))
-            recognized = any(name.lower() in {"porosity", "damaged", "pollution"} for name in names)
-            if declared_normal == recognized:
-                raise ValueError("image_info.is_normal conflicts with defects")
-            try:
-                original_image_id = int(info.get("id"))
-            except (TypeError, ValueError):
-                original_image_id = -1
-            values = ["valid", "", split_name(json_path), parsed.modality, parsed.battery_id, parsed.axis,
-                parsed.original_index, json_path.stem, safe_relative(raw_root,image_path), safe_relative(raw_root,json_path),
-                sha256_file(image_path), sha256_file(json_path), width, height, json.dumps(roi), json.dumps(outline),
-                json.dumps(defects), int(declared_normal), max(ratios, default=0.0), int("porosity" in {n.lower() for n in names}),
-                int("damaged" in {n.lower() for n in names}), int("pollution" in {n.lower() for n in names}),
-                original_image_id, json.dumps(data.get("roi")), len(defects)]
-            counts["valid"] += 1
-        except Exception as exc:
-            counts["invalid"] += 1
-            try:
-                parsed = parse_stem(json_path.stem)
-                modality,battery,axis,original_index=parsed.modality,parsed.battery_id,parsed.axis,parsed.original_index
-            except ValueError:
-                modality,battery,axis,original_index="",-1,"",-1
-            values = ["invalid", str(exc), split_name(json_path), modality,battery,axis,original_index,json_path.stem,
-                "",safe_relative(raw_root,json_path),"",sha256_file(json_path),0,0,"[]","[]","[]",1,0.0,0,0,0,
-                -1,"null",0]
-        db.execute(insert, values)
-        if index % 1000 == 0:
-            db.commit()
-        if index % 25000 == 0:
-            LOGGER.info(
-                "JSON parsed: %s | valid %s | invalid %s",
-                f"{index:,}",
-                f"{counts['valid']:,}",
-                f"{counts['invalid']:,}",
-            )
+    LOGGER.info("JSON-only scan: parsing extracted JSON with %d worker(s)", workers)
+    stream = _tasks(raw_root, image_index)
+    if workers > 1:
+        pool = ProcessPoolExecutor(max_workers=workers)
+        # map 은 입력 순서를 유지하므로 병렬로 돌려도 삽입 순서가 결정론적이다.
+        results = pool.map(_scan_pair, stream, chunksize=64)
+    else:
+        pool = None
+        results = map(_scan_pair, stream)
+    try:
+        for index, (ok, values) in enumerate(results, 1):
+            counts["json_seen"] += 1
+            counts["valid" if ok else "invalid"] += 1
+            db.execute(insert, values)
+            if index % 1000 == 0:
+                db.commit()
+            if index % 25000 == 0:
+                LOGGER.info(
+                    "JSON parsed: %s | valid %s | invalid %s",
+                    f"{index:,}",
+                    f"{counts['valid']:,}",
+                    f"{counts['invalid']:,}",
+                )
+    finally:
+        if pool is not None:
+            pool.shutdown()
     db.commit(); db.close()
     temporary.replace(cache_path)
     LOGGER.info("Scan cache complete: %s", cache_path)
     return dict(counts)
 
 
-def ensure_cache(raw_root: Path, cache_path: Path, refresh: bool = False) -> tuple[Path, bool]:
+def ensure_cache(raw_root: Path, cache_path: Path, refresh: bool = False, workers: int = 1) -> tuple[Path, bool]:
     if not refresh and cache_is_usable(cache_path, raw_root):
         LOGGER.info("Reusing scan cache; filesystem scan skipped: %s", cache_path)
         return cache_path, True
-    build_cache(raw_root, cache_path)
+    build_cache(raw_root, cache_path, workers=workers)
     return cache_path, False
 
 

@@ -136,7 +136,10 @@ class FailurePathTests(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=list(MANIFEST_COLUMNS))
             writer.writeheader(); writer.writerow(row)
         output = root / "output"
-        with mock.patch.object(generator, "_failure_engine", return_value=engine):
+        # _engine_for 는 프로세스마다 엔진을 한 번만 import 하므로, 테스트가 한 프로세스
+        # 안에서 여러 stub 을 쓰려면 그 캐시를 함께 되돌려야 한다.
+        with mock.patch.object(generator, "_failure_engine", return_value=engine), \
+                mock.patch.object(generator, "_WORKER_ENGINE", None):
             generator.generate(raw, plan, output)
         with (output / "manifests" / "dataset_manifest.csv").open("r", encoding="utf-8-sig", newline="") as handle:
             return output, list(csv.DictReader(handle))

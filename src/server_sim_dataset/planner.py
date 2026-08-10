@@ -116,21 +116,49 @@ def _best_window(
 
     population 이 주어지면 계획서 4.5 의 4 항대로 목적함수를 먼저 최소화한다. 주어지지
     않으면 4.5 의 3 항대로 index gap 합계를 먼저 최소화하고 시작 index 로 동률을 깬다.
+
+    후보마다 구간을 다시 순회하면 구간 길이에 비례해 느려진다. RGB 는 적격 ID 가 700 개를
+    넘고 구간 길이가 250 이라 그 방식으로는 plan 생성만 수십 분이 걸린다. 누적합을 미리
+    만들어 후보 하나를 상수 시간에 평가한다.
     """
+    ordered = sorted(rows, key=lambda row: row["original_index"])
+    total = len(ordered)
+    if total < length:
+        return None
     flags = DEFECT_FLAGS[modality]
-    best: tuple[tuple[float, ...], list[dict[str, Any]]] | None = None
-    for window in _windows(rows, length):
-        has_defect = any(any(row[flag] for flag in flags) for row in window)
-        if defective is not None and has_defect != defective:
+    defect_images = [0] * (total + 1)
+    per_flag = {flag: [0] * (total + 1) for flag in flags}
+    defect_counts = [0] * (total + 1)
+    for position, row in enumerate(ordered):
+        defect_images[position + 1] = defect_images[position] + (1 if any(row[flag] for flag in flags) else 0)
+        for flag in flags:
+            per_flag[flag][position + 1] = per_flag[flag][position] + (1 if row[flag] else 0)
+        defect_counts[position + 1] = defect_counts[position] + int(row["defect_count"])
+
+    best: tuple[tuple[float, ...], int] | None = None
+    for start in range(total - length + 1):
+        end = start + length
+        defects_here = defect_images[end] - defect_images[start]
+        if defective is not None and (defects_here > 0) != defective:
             continue
-        start = window[0]["original_index"]
+        first = ordered[start]["original_index"]
+        # 연속 구간의 gap 합계는 양 끝 index 차이에서 구간 길이를 빼면 나온다.
+        gaps = ordered[end - 1]["original_index"] - first - (length - 1)
         if population is None:
-            key: tuple[float, ...] = (float(_gaps(window)), float(start))
+            key: tuple[float, ...] = (float(gaps), float(first))
         else:
-            key = (*_objective(window, population, modality), float(_gaps(window)), float(start))
+            primary = abs(defects_here / length - population.defect_image_ratio) * 100
+            class_gap = max(
+                abs((per_flag[flag][end] - per_flag[flag][start]) / length - population.class_image_ratio[flag]) * 100
+                for flag in flags
+            )
+            count_gap = abs((defect_counts[end] - defect_counts[start]) / length - population.mean_defect_count)
+            if population.mean_defect_count > 0:
+                count_gap = count_gap / population.mean_defect_count * 100
+            key = (primary, max(class_gap, count_gap), float(gaps), float(first))
         if best is None or key < best[0]:
-            best = (key, window)
-    return None if best is None else best[1]
+            best = (key, start)
+    return None if best is None else ordered[best[1]:best[1] + length]
 
 
 @dataclass

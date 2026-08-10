@@ -140,6 +140,32 @@ JSON에 오류 종류와 메시지가 남는다.
 - `pairing_audit.csv`, `generation_summary.json`, `raw_extraction_feasibility.json`
 - `augmentation_json/` 전체와 `failure_masks/`
 
+## 7. 배포
+
+산출물은 아래 경로에만 올린다. 내 드라이브 아래의 팀 공유 폴더다.
+
+```
+gdrive:AIVLE_BigProject/data_simulation/<산출물폴더>
+```
+
+버전별 하위 폴더를 쓰고 기존 버전은 덮어쓰지 않는다. 예: `server-simulation-v1.2-zips`,
+`server-simulation-v1.3-zips`.
+
+```powershell
+rclone lsd gdrive:                                  # 최상위 폴더명을 눈으로 확인한다
+rclone copy ".\work\output" `
+  "gdrive:AIVLE_BigProject/data_simulation/server-simulation-v1.3-zips" `
+  --include "*.zip" --max-depth 1 --transfers 4 -P
+rclone check ".\work\output" `
+  "gdrive:AIVLE_BigProject/data_simulation/server-simulation-v1.3-zips" `
+  --include "*.zip" --max-depth 1 --one-way
+```
+
+Google Drive는 폴더 이름의 **대소문자를 구분한다**. `AIVLE_Bigproject`처럼 한 글자만
+달라도 `rclone copy`는 오류를 내지 않고 같은 이름의 다른 폴더를 새로 만든다. 팀은 그
+폴더를 보지 못한다. 경로를 직접 타이핑하지 말고 `rclone lsd gdrive:`의 출력을 그대로
+복사해서 쓰고, 업로드 뒤에는 `rclone check`와 `rclone lsd gdrive:`를 다시 확인한다.
+
 ## 테스트
 
 ```powershell

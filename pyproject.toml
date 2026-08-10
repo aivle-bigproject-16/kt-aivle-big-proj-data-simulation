@@ -4,10 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "server-sim-dataset"
-version = "1.2.0"
+version = "1.3.0.dev0"
 description = "JSON-only CT/RGB server simulation dataset pipeline"
 requires-python = ">=3.10"
-dependencies = ["Pillow>=10", "numpy>=1.26"]
+# 계획서 13.3의 재현성 요구에 따라 하한이 아닌 고정 버전을 사용한다.
+# quality-fail-augment v2.0 엔진과 같은 프로세스에서 동작하므로 해당 엔진의
+# requirements.lock 과 동일한 버전으로 맞춘다. 버전이 어긋나면 리샘플링 구현
+# 차이만으로도 출력 해시가 달라져 재현성이 깨진다.
+dependencies = [
+  "Pillow==12.3.0",
+  "numpy==2.5.1",
+  "shapely==2.1.2",
+  "psutil==7.0.0",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

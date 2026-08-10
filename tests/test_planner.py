@@ -18,7 +18,7 @@ from pathlib import Path
 from server_sim_dataset import planner
 from server_sim_dataset.schema import MANIFEST_COLUMNS
 
-from _synthetic import CT_DEFECT_ID, RGB_DEFECT_ID, build_synthetic_cache
+from _synthetic import CT_DEFECT_ID, RGB_MIXED_ID, RGB_POLLUTION_ID, build_synthetic_cache
 
 
 # 정본 목록은 schema.MANIFEST_COLUMNS 다. 여기서는 목록이 통째로 사라지거나 줄어드는
@@ -68,34 +68,66 @@ class QuantityTests(PlannerFixture):
         self.assertEqual(rgb, set(range(2_900_000_001, 2_900_000_021)))
         self.assertEqual(ct & rgb, set())
 
-    def test_stratified_allocation_follows_the_eligible_distribution(self) -> None:
-        """계획서 4.5(개정): 선정 20 개를 원본 ID 의 층 분포에 비례해 배분한다.
+    def test_ct_allocation_follows_the_eligible_distribution(self) -> None:
+        """계획서 4.5: CT 는 원본 ID 의 층 분포에 비례해 배분한다.
 
-        v1.2 와 v1.3 초안은 20 개 중 정확히 1 개만 제품불량으로 고정했다. 그 규칙에서는
-        세트의 클래스 비율이 불량 ID 하나로 정해져 모집단과 비교할 수 없다. 실제 원본에서
-        RGB 결함은 배터리 단위라 ID 의 67.5% 가 불량인데, 5% 규칙은 결함 이미지 비율을
-        0.05 로 묶어 버렸다.
-
-        이 fixture 는 적격 ID 가 정확히 20 개이므로 배분은 전부를 뽑는 것과 같다.
+        이 fixture 는 적격 CT ID 가 정확히 20 개이므로 배분은 전부를 뽑는 것과 같다.
         """
-        expected = {
-            "CT": {"zero": 19, "low_mid": 1},
-            "RGB": {"clean": 19, "both": 1},
-        }
-        for modality, strata in expected.items():
-            ids = [row for row in self.selected_rows if row["modality"] == modality]
-            self.assertEqual(len(ids), 20, modality)
-            self.assertEqual(Counter(row["stratum"] for row in ids), Counter(strata), modality)
-            defective = sum(1 for row in ids if row["product_status"] == "defective")
-            self.assertEqual(defective, 1, f"{modality}: 이 fixture 는 결함 ID 가 하나뿐이다")
+        ids = [row for row in self.selected_rows if row["modality"] == "CT"]
+        self.assertEqual(len(ids), 20)
+        self.assertEqual(Counter(row["stratum"] for row in ids), Counter({"zero": 19, "low_mid": 1}))
+        self.assertEqual(sum(1 for row in ids if row["product_status"] == "defective"), 1)
+
+    def test_rgb_hits_the_target_defect_rate_and_composition(self) -> None:
+        """계획서 4.5(v1.4): RGB 는 목표 결함률과 3 분류 구성으로 뽑는다.
+
+        RGB 결함은 배터리 단위라 250 프레임 창이 사실상 전부 결함이거나 전부 무결함이다.
+        층 비례로는 결함률이 5% 단위로만 움직이고 클래스 구성은 통제할 수 없다. v1.3
+        산출물에서 `Damaged` 단독 이미지가 0 장이었던 것이 그 결과다.
+        """
+        initial = [row for row in self.plan_rows
+                   if row["modality"] == "RGB" and row["capture_set"] == "initial_capture"]
+        composition = Counter()
+        for row in initial:
+            damaged, pollution = row["has_damaged"] == "1", row["has_pollution"] == "1"
+            composition["both" if damaged and pollution else
+                        "damaged_only" if damaged else
+                        "pollution_only" if pollution else "clean"] += 1
+        defects = sum(count for kind, count in composition.items() if kind != "clean")
+        self.assertAlmostEqual(defects / len(initial), planner.RGB_DEFECT_RATE, places=3)
+        self.assertGreater(composition["damaged_only"], 0, "Damaged 단독 이미지가 하나도 없다")
+        for kind, share in planner.RGB_DEFECT_COMPOSITION.items():
+            self.assertAlmostEqual(composition[kind] / defects, share, places=2, msg=kind)
+
+    def test_rgb_defective_ids_are_the_composition_carriers(self) -> None:
+        ids = {int(row["original_battery_id"]) for row in self.selected_rows
+               if row["modality"] == "RGB" and row["product_status"] == "defective"}
+        self.assertEqual(ids, {RGB_POLLUTION_ID, RGB_MIXED_ID})
+
+    def test_capture_quality_is_stratified_across_product_status(self) -> None:
+        """계획서 7.1(v1.4): FAIL 대상을 제품 상태별로 하나씩 고른다.
+
+        v1.3 산출물에는 촬영실패이면서 제품불량인 이미지가 한 장도 없었다. 두 축이
+        독립이라고 규정해 놓고 교차 칸이 비면 그 조합을 학습에도 평가에도 쓸 수 없다.
+        """
+        for modality, flags in (("CT", ["has_porosity"]), ("RGB", ["has_damaged", "has_pollution"])):
+            table = Counter(
+                (row["capture_quality"], any(row[flag] == "1" for flag in flags))
+                for row in self.plan_rows if row["modality"] == modality
+            )
+            for quality in ("PASS", "FAIL"):
+                for defective in (True, False):
+                    self.assertGreater(
+                        table[(quality, defective)], 0,
+                        f"{modality} {quality}/{'불량' if defective else '정상'} 칸이 비었다",
+                    )
 
     def test_allocation_is_proportional_and_respects_supply(self) -> None:
         """배분은 최대잉여법이고, 후보가 모자란 층의 몫은 다른 층으로 넘어간다."""
         available = {"a": 50, "b": 30, "c": 20}
         self.assertEqual(planner._allocate(available, 10, available), {"a": 5, "b": 3, "c": 2})
-        scarce = {"a": 50, "b": 30, "c": 20}
         supply = {"a": 50, "b": 1, "c": 20}
-        result = planner._allocate(scarce, 10, supply)
+        result = planner._allocate(available, 10, supply)
         self.assertEqual(result["b"], 1)
         self.assertEqual(sum(result.values()), 10)
         for name, count in result.items():
@@ -133,14 +165,6 @@ class SelectionTests(PlannerFixture):
             {"x", "y", "z"},
             "결함 ID 의 x/y/z 구간이 모두 결함 비율 기준으로 선택되어야 한다",
         )
-
-    def test_rgb_defective_window_is_the_defect_capable_id(self) -> None:
-        defective = [
-            row for row in self.selected_rows
-            if row["modality"] == "RGB" and row["product_status"] == "defective"
-        ]
-        self.assertEqual(len(defective), 1)
-        self.assertEqual(int(defective[0]["original_battery_id"]), RGB_DEFECT_ID)
 
     def test_objective_function_is_exposed_without_arbitrary_scale(self) -> None:
         """F-06, 계획서 4.4.

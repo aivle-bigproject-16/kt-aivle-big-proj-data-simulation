@@ -24,14 +24,23 @@ from server_sim_dataset.cache import SCHEMA
 
 
 CT_DEFECT_ID = 101
-RGB_DEFECT_ID = 901
 CT_NORMAL_IDS = tuple(range(102, 121))
-RGB_NORMAL_IDS = tuple(range(902, 921))
+
+# RGB 는 계획서 4.5(v1.4) 의 목표 구성 탐색을 태워야 하므로 세 가지 결함 조합을 모두
+# 만들어 둔다. 901 은 Pollution 우세, 902 는 Damaged 단독과 동시 결함 반반, 903 은
+# Pollution 단독뿐이다. 901 과 902 의 앞 250 프레임을 합치면 목표 40/35/25 가 정확히
+# 나오므로, 탐색이 그 조합을 찾아내는지 확인할 수 있다.
+RGB_POLLUTION_ID = 901
+RGB_MIXED_ID = 902
+RGB_SPARE_ID = 903
+RGB_DEFECT_IDS = (RGB_POLLUTION_ID, RGB_MIXED_ID, RGB_SPARE_ID)
+RGB_DEFECT_ID = RGB_POLLUTION_ID
+RGB_NORMAL_IDS = tuple(range(904, 922))
 
 # 결함 ID 는 무결함 구간도 확보할 수 있을 만큼 pool 을 넉넉히 준다.
 CT_DEFECT_POOL = {"x": 400, "y": 900, "z": 900}
 CT_NORMAL_POOL = {"x": 160, "y": 660, "z": 660}
-RGB_DEFECT_POOL = 600
+RGB_DEFECT_POOL = 300
 RGB_NORMAL_POOL = 300
 
 # 결함은 각 pool 의 앞쪽 구간에만 배치한다. 뒤쪽에는 무결함 구간이 남는다.
@@ -108,17 +117,15 @@ def _ct_rows() -> list[tuple[Any, ...]]:
 def _rgb_rows() -> list[tuple[Any, ...]]:
     rows: list[tuple[Any, ...]] = []
     for index in range(RGB_DEFECT_POOL):
-        defective = index < RGB_DEFECT_SPAN
-        rows.append(
-            _row(
-                "RGB",
-                RGB_DEFECT_ID,
-                "",
-                index,
-                damaged=defective and index % 30 == 0,
-                pollution=defective,
-            )
-        )
+        # 5 프레임 중 4 개는 Pollution 단독, 1 개는 동시 결함.
+        rows.append(_row("RGB", RGB_POLLUTION_ID, "", index,
+                         pollution=True, damaged=index % 5 == 4))
+    for index in range(RGB_DEFECT_POOL):
+        # 짝수는 동시 결함, 홀수는 Damaged 단독.
+        rows.append(_row("RGB", RGB_MIXED_ID, "", index,
+                         damaged=True, pollution=index % 2 == 0))
+    for index in range(RGB_DEFECT_POOL):
+        rows.append(_row("RGB", RGB_SPARE_ID, "", index, pollution=True))
     for battery_id in RGB_NORMAL_IDS:
         for index in range(RGB_NORMAL_POOL):
             rows.append(_row("RGB", battery_id, "", index))

@@ -38,6 +38,8 @@ RGB_DEFECT_RATE = 0.10
 RGB_DEFECT_COMPOSITION = {"pollution_only": 0.40, "both": 0.35, "damaged_only": 0.25}
 RGB_SEARCH_POOL = {"damaged_only": 24, "both": 12, "pollution_only": 12}
 RGB_WINDOWS_PER_ID = 8
+# 계획서 7.3 의 FAIL 구간 길이 L.
+FAIL_LENGTH_RANGE = (10, 25)
 
 SEARCH_ALGORITHM = "deterministic-sliding-window-v1.3"
 SEARCH_STOP_CONDITION = "exhaustive over eligible windows of the fixed length"
@@ -271,6 +273,20 @@ CT_POSITIVE_RATE_BINS = (
     ("very_high", 0.70, 1.01),
 )
 DEFECT_FREE_STRATA = {"CT": "zero", "RGB": "clean"}
+
+
+def _max_defect_run(item: "Selection", modality: str) -> int:
+    """구간 안에서 결함 프레임이 가장 많은 축의 결함 장수.
+
+    FAIL 구간은 한 축 안에서 연속으로 잡히므로, 교차 칸을 채우려면 그 축에 결함이
+    충분히 있어야 한다.
+    """
+    flags = DEFECT_FLAGS[modality]
+    counts: Counter = Counter()
+    for row in item.window:
+        if any(row[flag] for flag in flags):
+            counts[row["axis"] if modality == "CT" else ""] += 1
+    return max(counts.values(), default=0)
 
 
 def _frame_kind(row: dict[str, Any]) -> str:
@@ -665,6 +681,11 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
         fail_ids: set[int] = set()
         for status in ("defective", "normal"):
             pool = [item for item in chosen if item.product_status == status]
+            if status == "defective":
+                # 결함이 한두 장뿐인 ID 를 FAIL 대상으로 잡으면 교차 칸이 한 장짜리가
+                # 된다. FAIL 구간 최대 길이만큼 결함이 이어지는 축을 가진 ID 로 좁힌다.
+                dense = [item for item in pool if _max_defect_run(item, modality) >= FAIL_LENGTH_RANGE[1]]
+                pool = dense or pool
             if pool:
                 fail_ids.add(min(pool, key=lambda item: stable_seed(seed, modality, "fail-target", item.battery_id)).battery_id)
         for item in sorted(chosen, key=lambda item: stable_seed(seed, modality, "fail-fill", item.battery_id)):
@@ -696,12 +717,15 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 index for index, row in enumerate(item.window)
                 if modality != "CT" or row["axis"] == axis
             ]
-            length = rng.randint(10, 25)
+            length = rng.randint(*FAIL_LENGTH_RANGE)
             starts = list(range(0, len(eligible) - length + 1))
             if defective_target:
-                # 촬영실패와 제품불량이 함께 나타나는 이미지를 반드시 만든다.
-                overlapping = [s for s in starts if any(defect_at[index] for index in eligible[s:s + length])]
-                starts = overlapping or starts
+                # 촬영실패와 제품불량이 함께 나타나는 이미지를 충분히 만든다. 한 장만
+                # 겹치면 그 조합을 학습에도 평가에도 쓸 수 없다.
+                def overlap(position: int) -> int:
+                    return sum(defect_at[index] for index in eligible[position:position + length])
+                rich = [s for s in starts if overlap(s) >= length // 2]
+                starts = rich or [s for s in starts if overlap(s)] or starts
             start = rng.choice(starts)
             slots = eligible[start:start + length]
             k = rng.choices([1, 2, 3], weights=[0.6, 0.3, 0.1])[0]

@@ -801,7 +801,10 @@ def package_outputs(
                 source = output / capture_set / modality / folder
                 archive = output / f"{prefix}_{modality}_{folder}.zip"
                 names: set[str] = set()
-                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as handle:
+                # 이미지는 이미 JPEG/PNG 로 압축되어 있다. deflate 를 다시 걸면 용량은
+                # 사실상 그대로인데 32GB 를 재압축하느라 시간만 든다.
+                compression = zipfile.ZIP_STORED if folder == "images" else zipfile.ZIP_DEFLATED
+                with zipfile.ZipFile(archive, "w", compression=compression, compresslevel=None if compression == zipfile.ZIP_STORED else 6) as handle:
                     for path in sorted(source.glob("*")):
                         if path.is_file():
                             handle.write(path, path.name)

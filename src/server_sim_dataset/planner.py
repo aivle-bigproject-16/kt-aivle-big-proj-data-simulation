@@ -18,6 +18,7 @@ from .util import atomic_json, config_hash, stable_seed
 LOGGER = logging.getLogger(__name__)
 GLOBAL_SEED = 20260723
 CT_POROSITY_LIMIT = 0.25
+SELECTED_IDS = 20
 NORMAL_AUGMENTATIONS = {
     "CT": ("brightness_contrast_gamma", "partial_histogram_blend", "normal_noise_poisson", "low_frequency_shading", "percentile_tone_curve", "weak_reconstruction_kernel", "synchronized_flip"),
     "RGB": ("safe_translate_rotate", "brightness_contrast_gamma", "rgb_channel_gain_tone", "low_frequency_lighting", "poisson_noise", "weak_reconstruction"),
@@ -54,21 +55,33 @@ def _rows(cache_path: Path) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class Stats:
-    """계획서 4.4 의 1차·2차 기준을 계산하기 위한 집계값."""
+    """계획서 4.4 의 기준을 계산하기 위한 집계값.
+
+    conditional_class_ratio 는 결함 이미지만을 분모로 한 클래스 구성이다. RGB 는 결함이
+    배터리 단위라 불량 ID 의 사진은 사실상 전부 결함을 담는다. 그래서 세트 전체의 결함
+    이미지 비율은 20 개 중 몇 개를 불량으로 뽑느냐로 정해지고 원본 비율과 비교할 수 없다.
+    비교 가능한 것은 결함 이미지 안에서의 클래스 구성이다.
+    """
 
     defect_image_ratio: float
     class_image_ratio: dict[str, float]
+    conditional_class_ratio: dict[str, float]
     mean_defect_count: float
+    conditional_defect_count: float
 
 
 def _stats(rows: list[dict[str, Any]], modality: str) -> Stats:
     total = max(1, len(rows))
     flags = DEFECT_FLAGS[modality]
     defective = sum(any(row[flag] for flag in flags) for row in rows)
+    defect_total = sum(int(row["defect_count"]) for row in rows)
+    denominator = max(1, defective)
     return Stats(
         defect_image_ratio=defective / total,
         class_image_ratio={flag: sum(bool(row[flag]) for row in rows) / total for flag in flags},
-        mean_defect_count=sum(int(row["defect_count"]) for row in rows) / total,
+        conditional_class_ratio={flag: sum(bool(row[flag]) for row in rows) / denominator for flag in flags},
+        mean_defect_count=defect_total / total,
+        conditional_defect_count=defect_total / denominator,
     )
 
 
@@ -85,6 +98,17 @@ def _objective(window: list[dict[str, Any]], population: Stats, modality: str) -
     정렬을 사실상 무작위로 만들었다.
     """
     stats = _stats(window, modality)
+    if modality == "RGB":
+        primary = max(
+            abs(stats.conditional_class_ratio[flag] - population.conditional_class_ratio[flag]) * 100
+            for flag in population.conditional_class_ratio
+        )
+        count_gap = abs(stats.conditional_defect_count - population.conditional_defect_count)
+        if population.conditional_defect_count > 0:
+            count_gap = count_gap / population.conditional_defect_count * 100
+        # 3 순위는 불량 ID 가 얼마나 온전히 불량인지다. 원본에서 불량 배터리는 거의 모든
+        # 사진에 결함이 보이므로 결함 비율이 1 에 가까운 구간을 선호한다.
+        return primary, count_gap, (1.0 - stats.defect_image_ratio) * 100
     primary = abs(stats.defect_image_ratio - population.defect_image_ratio) * 100
     class_gap = max(
         abs(stats.class_image_ratio[flag] - population.class_image_ratio[flag]) * 100
@@ -149,15 +173,26 @@ def _best_window(
         if population is None:
             key: tuple[float, ...] = (float(gaps), float(first))
         else:
-            primary = abs(defects_here / length - population.defect_image_ratio) * 100
-            class_gap = max(
-                abs((per_flag[flag][end] - per_flag[flag][start]) / length - population.class_image_ratio[flag]) * 100
-                for flag in flags
-            )
-            count_gap = abs((defect_counts[end] - defect_counts[start]) / length - population.mean_defect_count)
-            if population.mean_defect_count > 0:
-                count_gap = count_gap / population.mean_defect_count * 100
-            key = (primary, class_gap, count_gap, float(gaps), float(first))
+            if modality == "RGB":
+                denominator = max(1, defects_here)
+                primary = max(
+                    abs((per_flag[flag][end] - per_flag[flag][start]) / denominator - population.conditional_class_ratio[flag]) * 100
+                    for flag in flags
+                )
+                count_gap = abs((defect_counts[end] - defect_counts[start]) / denominator - population.conditional_defect_count)
+                if population.conditional_defect_count > 0:
+                    count_gap = count_gap / population.conditional_defect_count * 100
+                key = (primary, count_gap, (1.0 - defects_here / length) * 100, float(gaps), float(first))
+            else:
+                primary = abs(defects_here / length - population.defect_image_ratio) * 100
+                class_gap = max(
+                    abs((per_flag[flag][end] - per_flag[flag][start]) / length - population.class_image_ratio[flag]) * 100
+                    for flag in flags
+                )
+                count_gap = abs((defect_counts[end] - defect_counts[start]) / length - population.mean_defect_count)
+                if population.mean_defect_count > 0:
+                    count_gap = count_gap / population.mean_defect_count * 100
+                key = (primary, class_gap, count_gap, float(gaps), float(first))
         if best is None or key < best[0]:
             best = (key, start)
     return None if best is None else ordered[best[1]:best[1] + length]
@@ -171,6 +206,7 @@ class Selection:
     primary_objective: float
     secondary_objective: float
     count_objective: float = 0.0
+    stratum: str = ""
     searched: int = 0
     rejection: str = ""
     reserve: list[tuple[str, list[int]]] = field(default_factory=list)
@@ -214,6 +250,58 @@ def _ct_window(
     return None
 
 
+# 계획서 4.5 의 층 경계. CT 는 전처리 v4.1 의 positive_rate_bin 을 그대로 쓴다. 같은
+# 원본을 두 파이프라인이 서로 다르게 나누면 비교가 불가능해지기 때문이다.
+CT_POSITIVE_RATE_BINS = (
+    ("zero", 0.0, 1e-9),
+    ("very_low", 1e-9, 0.05),
+    ("low_mid", 0.05, 0.30),
+    ("mid_high", 0.30, 0.70),
+    ("very_high", 0.70, 1.01),
+)
+DEFECT_FREE_STRATA = {"CT": "zero", "RGB": "clean"}
+
+
+def _stratum(rows: list[dict[str, Any]], modality: str) -> str:
+    """ID 하나를 원본 통계로 층에 배정한다.
+
+    CT 는 porosity 양성률 구간, RGB 는 보유 클래스 조합이다. RGB 의 결함은 배터리 단위라
+    양성률이 0 아니면 1 에 가까워서 양성률 구간이 의미가 없다.
+    """
+    if modality == "CT":
+        rate = sum(1 for row in rows if row["has_porosity"]) / max(1, len(rows))
+        for name, low, high in CT_POSITIVE_RATE_BINS:
+            if low <= rate < high:
+                return name
+        return CT_POSITIVE_RATE_BINS[-1][0]
+    damaged = any(row["has_damaged"] for row in rows)
+    pollution = any(row["has_pollution"] for row in rows)
+    if damaged and pollution:
+        return "both"
+    if damaged:
+        return "damaged_only"
+    if pollution:
+        return "pollution_only"
+    return "clean"
+
+
+def _allocate(counts: dict[str, int], total: int, available: dict[str, int]) -> dict[str, int]:
+    """층별 ID 개수를 최대잉여법으로 비례 배분한다.
+
+    후보가 배분량보다 적은 층은 가진 만큼만 쓰고, 남은 몫은 여유가 있는 층으로 넘긴다.
+    """
+    population = sum(counts.values())
+    exact = {name: counts[name] / population * total for name in counts}
+    result = {name: min(int(value), available[name]) for name, value in exact.items()}
+    while sum(result.values()) < total:
+        candidates = [name for name in counts if result[name] < available[name]]
+        if not candidates:
+            break
+        best = max(candidates, key=lambda name: (exact[name] - result[name], -stable_seed(GLOBAL_SEED, name)))
+        result[best] += 1
+    return result
+
+
 def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection], Stats]:
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
@@ -224,50 +312,72 @@ def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection],
         grouped[row["battery_id"]].append(row)
 
     population = _stats([row for values in grouped.values() for row in values], modality)
-    normal: list[Selection] = []
-    defective: list[Selection] = []
+    free = DEFECT_FREE_STRATA[modality]
+    # 층별 모집단을 따로 잡는다. 층화를 해 놓고 목적함수만 전체 모집단과 비교하면 각 층이
+    # 전체 평균을 흉내내다가 층 사이 희석이 생긴다. RGB 에서 both 층이 전체 조건부
+    # Damaged 0.38 을 겨냥해 뽑히고, 거기에 pollution_only 층이 섞여 0.27 로 떨어졌다.
+    layers: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    strata_of: dict[int, str] = {}
+    for battery_id, battery_rows in grouped.items():
+        stratum = _stratum(battery_rows, modality)
+        strata_of[battery_id] = stratum
+        layers[stratum].extend(battery_rows)
+    layer_population = {name: _stats(items, modality) for name, items in layers.items()}
+    candidates: dict[str, list[Selection]] = defaultdict(list)
     for battery_id, battery_rows in sorted(grouped.items()):
+        stratum = strata_of[battery_id]
+        reference = layer_population[stratum]
         if modality == "RGB":
-            normal_window = _best_window(battery_rows, RGB_COUNT, defective=False, modality=modality)
-            defect_window = _best_window(
-                battery_rows, RGB_COUNT, defective=True, modality=modality, population=population
+            window = _best_window(
+                battery_rows, RGB_COUNT,
+                defective=False if stratum == free else None,
+                modality=modality,
+                population=None if stratum == free else reference,
             )
         else:
             axes = {axis: [row for row in battery_rows if row["axis"] == axis] for axis in CT_COUNTS}
-            normal_window = _ct_window(axes, defective=False, population=None)
-            defect_window = _ct_window(axes, defective=True, population=population)
-        if normal_window is not None:
-            normal.append(Selection(battery_id, "normal", normal_window, 0.0, 0.0))
-        if defect_window is not None:
-            primary, secondary, counted = _objective(defect_window, population, modality)
-            defective.append(Selection(battery_id, "defective", defect_window, primary, secondary, counted))
+            window = _ct_window(axes, defective=stratum != free, population=reference)
+        if window is None:
+            continue
+        primary, secondary, counted = _objective(window, reference, modality)
+        product_status = "defective" if any(
+            row[flag] for row in window for flag in DEFECT_FLAGS[modality]
+        ) else "normal"
+        candidates[stratum].append(
+            Selection(battery_id, product_status, window, primary, secondary, counted, stratum=stratum)
+        )
 
-    # 계획서 4.5 의 2 항: 두 후보 집합에 동시에 속하는 ID 가 있으면 정상 후보 여유를
-    # 보존하기 위해 제품불량 전용 후보를 먼저 쓴다.
-    normal_ids = {item.battery_id for item in normal}
-    exclusive = [item for item in defective if item.battery_id not in normal_ids]
-    candidates = exclusive or defective
-    candidates.sort(
-        key=lambda item: (
-            item.primary_objective,
-            item.secondary_objective,
-            item.count_objective,
-            stable_seed(GLOBAL_SEED, modality, item.battery_id),
-        )
-    )
     if not candidates:
+        raise ValueError(f"{modality}: 적격 ID 가 없다")
+    available = {name: len(items) for name, items in candidates.items()}
+    quota = _allocate(available, SELECTED_IDS, available)
+    if sum(quota.values()) != SELECTED_IDS:
         raise ValueError(
-            f"{modality}: 계획서 4.5 의 제품불량 ID 후보가 없다. 반올림하지 않고 중단한다"
+            f"{modality}: 계획서 4.5 의 층화 배분으로 {SELECTED_IDS} 개를 채울 수 없다. "
+            f"적격 {available}, 배분 {quota}. 반올림하지 않고 중단한다"
         )
-    chosen_defect = candidates[0]
-    chosen_normal = [item for item in normal if item.battery_id != chosen_defect.battery_id][:19]
-    if len(chosen_normal) != 19:
-        raise ValueError(
-            f"{modality}: 계획서 4.5 는 제품정상 ID 19 개를 요구하는데 {len(chosen_normal)} 개뿐이다"
+    chosen: list[Selection] = []
+    for stratum, count in sorted(quota.items()):
+        items = sorted(
+            candidates[stratum],
+            key=lambda item: (
+                item.primary_objective,
+                item.secondary_objective,
+                item.count_objective,
+                stable_seed(GLOBAL_SEED, modality, item.battery_id),
+            ),
         )
-    for item in chosen_normal:
-        item.primary_objective, item.secondary_objective, item.count_objective = _objective(item.window, population, modality)
-    return [chosen_defect] + chosen_normal, population
+        chosen.extend(items[:count])
+    # 불량 ID 를 먼저 배치해 출력 ID 번호가 제품 상태와 무관하게 흩어지지 않도록 한다.
+    chosen.sort(key=lambda item: (item.product_status != "defective", item.stratum, item.battery_id))
+    LOGGER.info(
+        "%s stratified selection: %s (defective %d/%d)",
+        modality,
+        {name: quota[name] for name in sorted(quota) if quota[name]},
+        sum(1 for item in chosen if item.product_status == "defective"),
+        len(chosen),
+    )
+    return chosen, population
 
 
 def _normal_assignment(modality: str, slot: int, group_seed: int) -> tuple[list[str], dict[str, float]]:
@@ -439,6 +549,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 "original_battery_id": item.battery_id,
                 "output_battery_id": output_battery_id,
                 "product_status": item.product_status,
+                "stratum": item.stratum,
                 "fail_target": item.battery_id in fail_ids,
                 "source_count": len(item.window),
                 "search_algorithm": SEARCH_ALGORITHM,

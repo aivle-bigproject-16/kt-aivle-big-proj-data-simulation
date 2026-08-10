@@ -68,14 +68,38 @@ class QuantityTests(PlannerFixture):
         self.assertEqual(rgb, set(range(2_900_000_001, 2_900_000_021)))
         self.assertEqual(ct & rgb, set())
 
-    def test_exactly_one_defective_id_per_modality(self) -> None:
-        """계획서 4.5: ID 기준 제품불량 비율은 정확히 1/20 이다."""
-        for modality in ("CT", "RGB"):
-            statuses = Counter(
-                row["product_status"] for row in self.selected_rows if row["modality"] == modality
-            )
-            self.assertEqual(statuses["defective"], 1, modality)
-            self.assertEqual(statuses["normal"], 19, modality)
+    def test_stratified_allocation_follows_the_eligible_distribution(self) -> None:
+        """계획서 4.5(개정): 선정 20 개를 원본 ID 의 층 분포에 비례해 배분한다.
+
+        v1.2 와 v1.3 초안은 20 개 중 정확히 1 개만 제품불량으로 고정했다. 그 규칙에서는
+        세트의 클래스 비율이 불량 ID 하나로 정해져 모집단과 비교할 수 없다. 실제 원본에서
+        RGB 결함은 배터리 단위라 ID 의 67.5% 가 불량인데, 5% 규칙은 결함 이미지 비율을
+        0.05 로 묶어 버렸다.
+
+        이 fixture 는 적격 ID 가 정확히 20 개이므로 배분은 전부를 뽑는 것과 같다.
+        """
+        expected = {
+            "CT": {"zero": 19, "low_mid": 1},
+            "RGB": {"clean": 19, "both": 1},
+        }
+        for modality, strata in expected.items():
+            ids = [row for row in self.selected_rows if row["modality"] == modality]
+            self.assertEqual(len(ids), 20, modality)
+            self.assertEqual(Counter(row["stratum"] for row in ids), Counter(strata), modality)
+            defective = sum(1 for row in ids if row["product_status"] == "defective")
+            self.assertEqual(defective, 1, f"{modality}: 이 fixture 는 결함 ID 가 하나뿐이다")
+
+    def test_allocation_is_proportional_and_respects_supply(self) -> None:
+        """배분은 최대잉여법이고, 후보가 모자란 층의 몫은 다른 층으로 넘어간다."""
+        available = {"a": 50, "b": 30, "c": 20}
+        self.assertEqual(planner._allocate(available, 10, available), {"a": 5, "b": 3, "c": 2})
+        scarce = {"a": 50, "b": 30, "c": 20}
+        supply = {"a": 50, "b": 1, "c": 20}
+        result = planner._allocate(scarce, 10, supply)
+        self.assertEqual(result["b"], 1)
+        self.assertEqual(sum(result.values()), 10)
+        for name, count in result.items():
+            self.assertLessEqual(count, supply[name])
 
 
 class SelectionTests(PlannerFixture):

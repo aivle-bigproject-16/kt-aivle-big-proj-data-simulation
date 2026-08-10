@@ -658,6 +658,10 @@ def generate(
         if done:
             LOGGER.info("Resuming: %s rows already verified", f"{len(done):,}")
     pending = [row for row in rows if row["sample_id"] not in done]
+    if any(row["failure_case"] for row in pending):
+        # 계획서 13.3 은 실행에 쓴 augment.py 의 SHA-256 을 남기라고 규정한다. 워커만
+        # 엔진을 import 하면 부모가 그 값을 알 수 없으므로 여기서 한 번 확인한다.
+        _engine_for(engine_root)
     tasks = [
         (raw_root, output, row, plan_hash, engine_root, strict_source_hash)
         for row in pending

@@ -79,12 +79,16 @@ class QuantityTests(PlannerFixture):
 
 
 class SelectionTests(PlannerFixture):
-    def test_ct_defective_window_covers_every_axis(self) -> None:
+    def test_ct_defective_window_is_chosen_for_defect_ratio(self) -> None:
         """F-07, 계획서 4.5 의 4 항.
 
-        결함 ID 의 구간은 처음부터 결함 비율 기준으로 골라야 한다. 무결함 구간을 먼저
-        찾고 한 축만 사후 교체하면 결함이 한 축에 몰린다. v1.2 산출물에서 CT 결함 ID
-        1,450 장 중 650 장에만, 그것도 한 축에만 porosity 가 있었던 것이 이 결함이다.
+        결함 ID 의 구간은 결함 비율 기준으로 골라야 한다. v1.2 는 무결함 구간을 먼저 찾고
+        porosity 가 하나도 없을 때만 한 축을 사후 교체했기 때문에, 결함이 한 축에만 남고
+        1,450 장 중 650 장에만 porosity 가 있었다.
+
+        계획서 4.5 의 판정 기준 자체는 선택 전체에 porosity 가 하나 이상이면 되고 축별
+        조건이 아니다. 이 fixture 는 세 축 모두에 결함 구간이 존재하도록 만들었으므로,
+        목적함수로 고르면 세 축 모두 결함을 포함하는 구간이 선택된다.
         """
         defective = [
             row for row in self.plan_rows

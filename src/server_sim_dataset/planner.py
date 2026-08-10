@@ -72,12 +72,14 @@ def _stats(rows: list[dict[str, Any]], modality: str) -> Stats:
     )
 
 
-def _objective(window: list[dict[str, Any]], population: Stats, modality: str) -> tuple[float, float]:
-    """계획서 4.4 의 1차·2차 목적값을 %p 단위로 돌려준다.
+def _objective(window: list[dict[str, Any]], population: Stats, modality: str) -> tuple[float, float, float]:
+    """계획서 4.4 의 목적값을 %p 단위로 돌려준다. 작을수록 모집단에 가깝다.
 
-    1차는 정상 대 결함 이미지 비율의 절대 차이이고, 2차는 클래스별 이미지 비율 차이와
-    이미지당 annotation 수 차이 중 큰 쪽이다. 두 값 모두 작을수록 비교 기준 모집단에
-    가깝다.
+    1차는 정상 대 결함 이미지 비율의 절대 차이다. 2차는 계획서 본문의 순서를 그대로
+    따라 클래스별 이미지 비율 차이를 먼저 보고, 그 다음에 이미지당 annotation 수 차이를
+    본다. 두 값을 하나로 합치면 안 된다. 실제 원본에서 annotation 수 항이 클래스 비율 항을
+    가려서, `Damaged` 가 하나도 없는 ID 가 `Damaged` 를 가진 동률 후보를 이기는 일이
+    생겼다.
 
     v1.2 는 후보 비율을 20 으로 나눈 뒤 모집단과 비교했다. 그 스케일에는 근거가 없고
     정렬을 사실상 무작위로 만들었다.
@@ -91,7 +93,7 @@ def _objective(window: list[dict[str, Any]], population: Stats, modality: str) -
     count_gap = abs(stats.mean_defect_count - population.mean_defect_count)
     if population.mean_defect_count > 0:
         count_gap = count_gap / population.mean_defect_count * 100
-    return primary, max(class_gap, count_gap)
+    return primary, class_gap, count_gap
 
 
 def _windows(rows: list[dict[str, Any]], length: int) -> Iterable[list[dict[str, Any]]]:
@@ -155,7 +157,7 @@ def _best_window(
             count_gap = abs((defect_counts[end] - defect_counts[start]) / length - population.mean_defect_count)
             if population.mean_defect_count > 0:
                 count_gap = count_gap / population.mean_defect_count * 100
-            key = (primary, max(class_gap, count_gap), float(gaps), float(first))
+            key = (primary, class_gap, count_gap, float(gaps), float(first))
         if best is None or key < best[0]:
             best = (key, start)
     return None if best is None else ordered[best[1]:best[1] + length]
@@ -168,6 +170,7 @@ class Selection:
     window: list[dict[str, Any]]
     primary_objective: float
     secondary_objective: float
+    count_objective: float = 0.0
     searched: int = 0
     rejection: str = ""
     reserve: list[tuple[str, list[int]]] = field(default_factory=list)
@@ -179,20 +182,36 @@ def _ct_window(
     defective: bool,
     population: Stats | None,
 ) -> list[dict[str, Any]] | None:
+    """CT 한 ID 의 x/y/z 구간을 고른다.
+
+    제품정상 후보는 계획서 4.5 의 3 항대로 porosity 를 제거한 pool 안에서 index gap 이
+    가장 작은 연속 구간을 고른다.
+
+    제품불량 후보는 축마다 결함 구간을 요구하지 않는다. 계획서 4.5 의 판정 기준은
+    "선택된 x/y/z 구간에 porosity annotation 이 하나 이상"이며 축별 조건이 아니다. 실제
+    원본에서 porosity 는 한 축에 몰려 있어서, 축마다 결함을 요구하면 적격 ID 가 0 개가
+    된다. 대신 축별 구간은 4.5 의 4 항대로 목적함수로 고르고, 그렇게 고른 결과에 porosity
+    가 하나도 없을 때만 결함 구간이 있는 축 하나를 바꾼다.
+    """
     parts: list[dict[str, Any]] = []
     for axis, count in CT_COUNTS.items():
-        pool = axes[axis] if defective else [row for row in axes[axis] if not row["has_porosity"]]
-        part = _best_window(
-            pool,
-            count,
-            defective=True if defective else False,
-            modality="CT",
-            population=population if defective else None,
-        )
+        if defective:
+            part = _best_window(axes[axis], count, defective=None, modality="CT", population=population)
+        else:
+            pool = [row for row in axes[axis] if not row["has_porosity"]]
+            part = _best_window(pool, count, defective=False, modality="CT", population=None)
         if part is None:
             return None
         parts.extend(part)
-    return parts
+    if not defective:
+        return parts
+    if any(row["has_porosity"] for row in parts):
+        return parts
+    for axis, count in CT_COUNTS.items():
+        replacement = _best_window(axes[axis], count, defective=True, modality="CT", population=population)
+        if replacement is not None:
+            return [row for row in parts if row["axis"] != axis] + replacement
+    return None
 
 
 def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection], Stats]:
@@ -220,8 +239,8 @@ def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection],
         if normal_window is not None:
             normal.append(Selection(battery_id, "normal", normal_window, 0.0, 0.0))
         if defect_window is not None:
-            primary, secondary = _objective(defect_window, population, modality)
-            defective.append(Selection(battery_id, "defective", defect_window, primary, secondary))
+            primary, secondary, counted = _objective(defect_window, population, modality)
+            defective.append(Selection(battery_id, "defective", defect_window, primary, secondary, counted))
 
     # 계획서 4.5 의 2 항: 두 후보 집합에 동시에 속하는 ID 가 있으면 정상 후보 여유를
     # 보존하기 위해 제품불량 전용 후보를 먼저 쓴다.
@@ -232,6 +251,7 @@ def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection],
         key=lambda item: (
             item.primary_objective,
             item.secondary_objective,
+            item.count_objective,
             stable_seed(GLOBAL_SEED, modality, item.battery_id),
         )
     )
@@ -246,7 +266,7 @@ def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection],
             f"{modality}: 계획서 4.5 는 제품정상 ID 19 개를 요구하는데 {len(chosen_normal)} 개뿐이다"
         )
     for item in chosen_normal:
-        item.primary_objective, item.secondary_objective = _objective(item.window, population, modality)
+        item.primary_objective, item.secondary_objective, item.count_objective = _objective(item.window, population, modality)
     return [chosen_defect] + chosen_normal, population
 
 
@@ -427,6 +447,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 "search_stop_condition": SEARCH_STOP_CONDITION,
                 "primary_objective": round(item.primary_objective, 8),
                 "secondary_objective": round(item.secondary_objective, 8),
+                "annotation_count_objective": round(item.count_objective, 8),
                 "population_defect_image_ratio": round(population.defect_image_ratio, 8),
                 "population_mean_defect_count": round(population.mean_defect_count, 8),
                 "slice_order_reversed": reverse,

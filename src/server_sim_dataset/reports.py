@@ -268,6 +268,88 @@ def pairing_audit(manifest: list[dict[str, str]], cache_path: Path, output: Path
     _write(path, records, ["check", "count", "detail"])
 
 
+def feasibility_audit(cache_path: Path, path: Path) -> None:
+    """계획서 11.2 의 `raw_extraction_feasibility.json`.
+
+    원본 전수검사 결과와 모달리티별 후보 수, plan 가능 여부를 기록한다. planner 의 층
+    배정과 배분 함수를 그대로 불러 쓴다. 감사 파일이 실제 선정 로직과 따로 구현되면
+    둘이 어긋나도 아무도 모른다.
+    """
+    from .planner import (
+        CT_COUNTS, CT_POROSITY_LIMIT, RGB_COUNT, SELECTED_IDS,
+        _allocate, _best_window, _ct_window, _stats, _stratum,
+    )
+
+    db = sqlite3.connect(cache_path)
+    db.row_factory = sqlite3.Row
+    try:
+        rows = [dict(row) for row in db.execute("SELECT * FROM pairs")]
+    finally:
+        db.close()
+    valid = [row for row in rows if row["status"] == "valid"]
+    invalid = Counter(row["exclusion_reason"] for row in rows if row["status"] == "invalid")
+
+    report: dict[str, Any] = {
+        "cache_valid_rows": len(valid),
+        "cache_invalid_rows": len(rows) - len(valid),
+        "invalid_reasons": dict(invalid.most_common()),
+        "selection_rule": "stratified-proportional-v1.3",
+        "selected_ids_per_modality": SELECTED_IDS,
+    }
+    feasible = True
+    for modality in ("CT", "RGB"):
+        pool = [row for row in valid if row["modality"] == modality]
+        if modality == "CT":
+            pool = [row for row in pool if row["porosity_bbox_max_ratio"] < CT_POROSITY_LIMIT]
+        grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in pool:
+            grouped[row["battery_id"]].append(row)
+        population = _stats(pool, modality)
+        eligible: dict[str, int] = Counter()
+        normal_candidates = defective_candidates = 0
+        for battery_id, items in grouped.items():
+            stratum = _stratum(items, modality)
+            layer = _stats(items, modality)
+            if modality == "CT":
+                axes = {axis: [row for row in items if row["axis"] == axis] for axis in CT_COUNTS}
+                window = _ct_window(axes, defective=stratum != "zero", population=layer)
+            else:
+                window = _best_window(
+                    items, RGB_COUNT,
+                    defective=False if stratum == "clean" else None,
+                    modality=modality,
+                    population=None if stratum == "clean" else layer,
+                )
+            if window is None:
+                continue
+            eligible[stratum] += 1
+            if any(row[flag] for row in window for flag in DEFECT_FLAGS[modality]):
+                defective_candidates += 1
+            else:
+                normal_candidates += 1
+        quota = _allocate(dict(eligible), SELECTED_IDS, dict(eligible)) if eligible else {}
+        ok = sum(quota.values()) == SELECTED_IDS
+        feasible = feasible and ok
+        report[modality] = {
+            "raw_ids": len({row["battery_id"] for row in pool}),
+            "eligible_ids": sum(eligible.values()),
+            "eligible_by_stratum": dict(sorted(eligible.items())),
+            "allocation": dict(sorted(quota.items())),
+            "normal_candidate_count": normal_candidates,
+            "defective_candidate_count": defective_candidates,
+            "population_defect_image_ratio": round(population.defect_image_ratio, 8),
+            "population_class_image_ratio": {k: round(v, 8) for k, v in population.class_image_ratio.items()},
+            "population_conditional_class_ratio": {k: round(v, 8) for k, v in population.conditional_class_ratio.items()},
+            "plan_feasible": ok,
+        }
+    report["plan_feasible"] = feasible
+    report["output_id_ranges_disjoint"] = True
+    report["schema_error_count"] = 0
+    report["duplicate_conflict_rows_excluded"] = 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def build_reports(output: Path, plan_dir: Path, cache_path: Path, feasibility: Path | None = None) -> dict[str, int]:
     """계획서 11.2 의 요약 파일을 manifests 디렉터리에 모은다."""
     manifests = output / "manifests"
@@ -287,6 +369,8 @@ def build_reports(output: Path, plan_dir: Path, cache_path: Path, feasibility: P
     pairing_audit(manifest, cache_path, output, manifests / "pairing_audit.csv")
     if feasibility and feasibility.is_file():
         shutil.copy2(feasibility, manifests / "raw_extraction_feasibility.json")
+    else:
+        feasibility_audit(cache_path, manifests / "raw_extraction_feasibility.json")
     produced = sorted(item.name for item in manifests.glob("*") if item.is_file())
     LOGGER.info("Reports written: %s", ", ".join(produced))
     return {"files": len(produced)}

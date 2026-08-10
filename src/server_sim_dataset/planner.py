@@ -11,14 +11,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__
-from .schema import GENERATION_COLUMNS, MANIFEST_COLUMNS, output_stem
+from .schema import CT_COUNTS, GENERATION_COLUMNS, MANIFEST_COLUMNS, RGB_COUNT, output_stem
 from .util import atomic_json, config_hash, stable_seed
 
 
 LOGGER = logging.getLogger(__name__)
 GLOBAL_SEED = 20260723
-CT_COUNTS = {"x": 150, "y": 650, "z": 650}
-RGB_COUNT = 250
 CT_POROSITY_LIMIT = 0.25
 NORMAL_AUGMENTATIONS = {
     "CT": ("brightness_contrast_gamma", "partial_histogram_blend", "normal_noise_poisson", "low_frequency_shading", "percentile_tone_curve", "weak_reconstruction_kernel", "synchronized_flip"),

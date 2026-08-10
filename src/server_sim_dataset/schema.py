@@ -55,6 +55,16 @@ GENERATION_COLUMNS: frozenset[str] = frozenset({
 })
 
 
+# 계획서 5.1 의 ID 당 추출 수량. envelope 길이는 실행 대상 행 수가 아니라 이 계획값을
+# 써야 한다. --limit 이나 smoke 로 일부만 생성해도 같은 강도 곡선이 나와야 하기 때문이다.
+CT_COUNTS = {"x": 150, "y": 650, "z": 650}
+RGB_COUNT = 250
+
+
+def sequence_length(modality: str, axis: str) -> int:
+    return CT_COUNTS[axis] if modality == "CT" else RGB_COUNT
+
+
 def output_stem(capture_set: str, modality: str, output_battery_id: int, axis: str, index: int) -> str:
     """계획서 9.1 의 출력 stem 을 만든다.
 

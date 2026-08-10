@@ -16,53 +16,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from server_sim_dataset import planner
+from server_sim_dataset.schema import MANIFEST_COLUMNS
 
 from _synthetic import CT_DEFECT_ID, RGB_DEFECT_ID, build_synthetic_cache
 
 
-# 계획서 11.1 의 60 개 컬럼에, 8.1 이 본문에서 요구하는 원본 추적 3 개와 7.5 의
-# reserve 6 개, 9.1 의 JPEG profile 1 개, 6.2 의 slice 단위 seed 1 개를 더한 목록이다.
-# 수정계획서 v1.3 의 5 장이 정본이며, 구현이 끝나면 schema.MANIFEST_COLUMNS 로 옮긴다.
-MANIFEST_COLUMNS = (
-    # 식별
-    "sample_id", "synthetic_id", "capture_set", "capture_group_id", "retry_of_sample_id",
-    "modality", "original_battery_id", "output_battery_id", "product_status", "axis",
-    # 원본 순서
-    "original_index", "source_sequence_order", "output_sequence_order", "source_split",
-    # index 누락
-    "index_gap_before", "index_gap_size",
-    # 원본 추적
-    "original_stem", "orig_image_relative_path", "orig_json_relative_path",
-    "original_image_id", "original_image_file_name", "original_roi",
-    # 원본 무결성
-    "source_image_sha256", "source_json_sha256", "pixel_hash",
-    # 제품 결함
-    "original_is_normal", "has_porosity", "has_damaged", "has_pollution",
-    # 객체 수
-    "original_defect_count", "output_defect_count", "class_instance_counts",
-    # 촬영 품질
-    "capture_quality", "failure_case", "failure_segment_id", "failure_artifact_mask_path",
-    # 생성 상태
-    "generation_status", "exclusion_or_retry_reason",
-    # 정상 증강
-    "base_augmentation_names", "normal_augmentation_parameters", "normal_augmentation_seed",
-    "slice_seed", "normal_base_pixel_hash",
-    # FAIL 증강
-    "failure_window_start", "failure_window_end", "failure_method_order",
-    "failure_augmentation_parameters", "augmentation_json_path", "augmentation_json_sha256",
-    # reserve
-    "reserve_source_split", "reserve_original_battery_id", "reserve_original_index",
-    "reserve_original_stem", "reserve_rank", "reserve_reason",
-    # 재현성
-    "global_seed", "item_seed", "generator_version", "config_hash", "plan_sha256",
-    # 출력
-    "output_image_path", "output_json_path", "output_det_path", "output_seg_path",
-    "jpeg_profile_id",
-    # 출력 무결성
-    "output_image_sha256", "output_json_sha256", "output_det_sha256", "output_seg_sha256",
-    # 품질 검증
-    "quality_gate_passed", "quality_gate_metrics",
-)
+# 정본 목록은 schema.MANIFEST_COLUMNS 다. 여기서는 목록이 통째로 사라지거나 줄어드는
+# 사고만 잡는다. 어떤 컬럼이 실제로 채워지는지는 아래 ManifestSchemaTests 가 본다.
+EXPECTED_COLUMN_COUNT = 72
 
 
 class PlannerFixture(unittest.TestCase):
@@ -247,6 +208,14 @@ class ReserveTests(PlannerFixture):
 
 
 class ManifestSchemaTests(PlannerFixture):
+    def test_schema_declares_the_full_column_set(self) -> None:
+        """수정계획서 v1.3 의 5 장이 정의한 72 개다."""
+        self.assertEqual(len(MANIFEST_COLUMNS), EXPECTED_COLUMN_COUNT)
+        self.assertEqual(len(set(MANIFEST_COLUMNS)), EXPECTED_COLUMN_COUNT, "중복 컬럼이 있다")
+
+    def test_plan_header_is_exactly_the_schema(self) -> None:
+        self.assertEqual(list(self.plan_rows[0]), list(MANIFEST_COLUMNS))
+
     def test_plan_carries_every_column_the_manifest_needs(self) -> None:
         """F-04, 계획서 11.1.
 

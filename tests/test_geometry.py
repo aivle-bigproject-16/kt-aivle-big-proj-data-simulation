@@ -103,7 +103,12 @@ class PolygonTransformTests(unittest.TestCase):
         bright_original = [x for x in range(width) if image.getpixel((x, 0)) > 128]
         bright_mirrored = [x for x in range(width) if mirrored.getpixel((x, 0)) > 128]
         mapped = [
-            generator._transform_polygon([(float(x), 0.0)] * 3, width, height, flip_x=True)[0][0]
+            generator._transform_polygon(
+                [(float(x), 1.0), (float(x), 6.0), (float(x) + 0.5, 3.0)],
+                width,
+                height,
+                flip_x=True,
+            )[0][0]
             for x in bright_original
         ]
         self.assertEqual(sorted(mapped), sorted(float(x) for x in bright_mirrored))

@@ -87,6 +87,9 @@ def _row(
         int(porosity),
         int(damaged),
         int(pollution),
+        abs(hash(stem)) % 1_000_000,
+        json.dumps([100, 100]) if modality == "CT" else "null",
+        len(defects),
     )
 
 
@@ -137,7 +140,8 @@ def build_synthetic_cache(path: Path) -> Path:
             "status,exclusion_reason,source_split,modality,battery_id,axis,original_index,original_stem,"
             "image_relative_path,json_relative_path,image_sha256,json_sha256,width,height,roi_json,"
             "outline_json,defects_json,original_is_normal,porosity_bbox_max_ratio,has_porosity,"
-            "has_damaged,has_pollution) VALUES(" + ",".join("?" * 22) + ")",
+            "has_damaged,has_pollution,original_image_id,original_roi_json,defect_count) "
+            "VALUES(" + ",".join("?" * 25) + ")",
             _ct_rows() + _rgb_rows(),
         )
         connection.commit()

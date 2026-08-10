@@ -19,6 +19,17 @@ def stable_seed(*parts: object) -> int:
     return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big")
 
 
+def config_hash(payload: Any) -> str:
+    """생성 설정의 정규화 해시를 만든다.
+
+    계획서 13.3 은 동일 입력·계획·버전에서 같은 결과가 나오는지 확인할 수 있어야
+    한다고 규정한다. 버전만으로는 상수 변경을 구분할 수 없으므로, seed 와 수량표와
+    증강 목록처럼 결과를 바꾸는 설정 전체를 정렬 직렬화해 해시로 남긴다.
+    """
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def safe_relative(root: Path, path: Path) -> str:
     root = root.resolve()
     path = path.resolve()

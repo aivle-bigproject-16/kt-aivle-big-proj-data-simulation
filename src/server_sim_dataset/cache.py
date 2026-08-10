@@ -16,7 +16,10 @@ from .util import safe_relative, sha256_file
 
 
 LOGGER = logging.getLogger(__name__)
-CACHE_VERSION = 1
+# v2 에서 original_image_id, original_roi_json, defect_count 를 추가했다. 계획서 8.1 이
+# manifest 에 원본 식별자와 원본 ROI 원본값을 보존하라고 규정하는데 v1 스키마에는 두
+# 값이 없어 생성 단계에서 원본 JSON 을 다시 열어야 했다.
+CACHE_VERSION = 2
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 ARCHIVE_SUFFIXES = {".tar", ".tgz", ".gz", ".zip", ".7z", ".rar"}
 
@@ -47,7 +50,9 @@ CREATE TABLE pairs (
  height INTEGER NOT NULL, roi_json TEXT NOT NULL, outline_json TEXT NOT NULL,
  defects_json TEXT NOT NULL, original_is_normal INTEGER NOT NULL,
  porosity_bbox_max_ratio REAL NOT NULL, has_porosity INTEGER NOT NULL,
- has_damaged INTEGER NOT NULL, has_pollution INTEGER NOT NULL
+ has_damaged INTEGER NOT NULL, has_pollution INTEGER NOT NULL,
+ original_image_id INTEGER NOT NULL, original_roi_json TEXT NOT NULL,
+ defect_count INTEGER NOT NULL
 );
 CREATE INDEX pairs_key ON pairs(modality,battery_id,axis,original_index);
 CREATE INDEX pairs_status ON pairs(status);
@@ -88,7 +93,7 @@ def build_cache(raw_root: Path, cache_path: Path) -> dict[str, int]:
         ("cache_version", str(CACHE_VERSION)), ("raw_root", str(raw_root)), ("label_source", "extracted-json-only")
     ])
     counts = defaultdict(int)
-    insert = "INSERT INTO pairs(status,exclusion_reason,source_split,modality,battery_id,axis,original_index,original_stem,image_relative_path,json_relative_path,image_sha256,json_sha256,width,height,roi_json,outline_json,defects_json,original_is_normal,porosity_bbox_max_ratio,has_porosity,has_damaged,has_pollution) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    insert = "INSERT INTO pairs(status,exclusion_reason,source_split,modality,battery_id,axis,original_index,original_stem,image_relative_path,json_relative_path,image_sha256,json_sha256,width,height,roi_json,outline_json,defects_json,original_is_normal,porosity_bbox_max_ratio,has_porosity,has_damaged,has_pollution,original_image_id,original_roi_json,defect_count) VALUES(" + ",".join("?" * 25) + ")"
     LOGGER.info("JSON-only scan: parsing extracted JSON files")
     for index, json_path in enumerate(_files(raw_root, {".json"}), 1):
         counts["json_seen"] += 1
@@ -125,11 +130,16 @@ def build_cache(raw_root: Path, cache_path: Path) -> dict[str, int]:
             recognized = any(name.lower() in {"porosity", "damaged", "pollution"} for name in names)
             if declared_normal == recognized:
                 raise ValueError("image_info.is_normal conflicts with defects")
+            try:
+                original_image_id = int(info.get("id"))
+            except (TypeError, ValueError):
+                original_image_id = -1
             values = ["valid", "", split_name(json_path), parsed.modality, parsed.battery_id, parsed.axis,
                 parsed.original_index, json_path.stem, safe_relative(raw_root,image_path), safe_relative(raw_root,json_path),
                 sha256_file(image_path), sha256_file(json_path), width, height, json.dumps(roi), json.dumps(outline),
                 json.dumps(defects), int(declared_normal), max(ratios, default=0.0), int("porosity" in {n.lower() for n in names}),
-                int("damaged" in {n.lower() for n in names}), int("pollution" in {n.lower() for n in names})]
+                int("damaged" in {n.lower() for n in names}), int("pollution" in {n.lower() for n in names}),
+                original_image_id, json.dumps(data.get("roi")), len(defects)]
             counts["valid"] += 1
         except Exception as exc:
             counts["invalid"] += 1
@@ -139,7 +149,8 @@ def build_cache(raw_root: Path, cache_path: Path) -> dict[str, int]:
             except ValueError:
                 modality,battery,axis,original_index="",-1,"",-1
             values = ["invalid", str(exc), split_name(json_path), modality,battery,axis,original_index,json_path.stem,
-                "",safe_relative(raw_root,json_path),"",sha256_file(json_path),0,0,"[]","[]","[]",1,0.0,0,0,0]
+                "",safe_relative(raw_root,json_path),"",sha256_file(json_path),0,0,"[]","[]","[]",1,0.0,0,0,0,
+                -1,"null",0]
         db.execute(insert, values)
         if index % 1000 == 0:
             db.commit()
@@ -162,6 +173,23 @@ def ensure_cache(raw_root: Path, cache_path: Path, refresh: bool = False) -> tup
         return cache_path, True
     build_cache(raw_root, cache_path)
     return cache_path, False
+
+
+def source_hashes(cache_path: Path) -> dict[str, tuple[str, str]]:
+    """원본 stem 별 (image_sha256, json_sha256) 를 돌려준다.
+
+    생성 단계가 행마다 원본을 다시 해싱하면 4000x4000 JPEG 37,400 장의 I/O 가 전체
+    시간을 지배한다. 캐시가 스캔 시점에 이미 계산해 둔 값이 있으므로 그것과 대조한다.
+    원본 파일 자체를 다시 해싱하는 것은 계획서 13.3 의 엄격 검사가 필요할 때만 한다.
+    """
+    db = _database(cache_path)
+    try:
+        rows = db.execute(
+            "SELECT original_stem,image_sha256,json_sha256 FROM pairs WHERE status='valid'"
+        )
+        return {row["original_stem"]: (row["image_sha256"], row["json_sha256"]) for row in rows}
+    finally:
+        db.close()
 
 
 def export_cache_csv(cache_path: Path, output: Path) -> None:

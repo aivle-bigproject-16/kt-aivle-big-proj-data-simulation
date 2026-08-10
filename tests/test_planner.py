@@ -209,8 +209,30 @@ class ReserveTests(PlannerFixture):
         """
         fail_rows = [row for row in self.plan_rows if row["failure_case"]]
         self.assertTrue(fail_rows, "FAIL 행이 없다")
-        for column in ("reserve_rank", "reserve_original_stem", "reserve_reason"):
+        for column in ("reserve_candidates", "reserve_rank", "reserve_original_stem", "reserve_reason"):
             self.assertIn(column, fail_rows[0], f"plan 에 {column} 이 없다")
+        for row in fail_rows:
+            candidates = json.loads(row["reserve_candidates"] or "[]")
+            self.assertTrue(candidates, f"{row['sample_id']} 에 reserve 후보가 없다")
+            self.assertEqual(
+                [item["rank"] for item in candidates],
+                list(range(1, len(candidates) + 1)),
+                "reserve 후보의 우선순위가 연속된 정수가 아니다",
+            )
+            for item in candidates:
+                self.assertTrue(item["original_stem"])
+                self.assertTrue(item["reason"])
+
+    def test_reserve_does_not_reuse_the_primary_failure_slots(self) -> None:
+        """계획서 7.5: reserve 는 주 FAIL 구간과 겹치지 않는 대체 구간이어야 한다."""
+        primary = {
+            row["original_stem"] for row in self.plan_rows
+            if row["failure_case"] and row["capture_set"] == "initial_capture"
+        }
+        for row in self.plan_rows:
+            for item in json.loads(row["reserve_candidates"] or "[]"):
+                if item["reason"] == "same-axis":
+                    self.assertNotIn(item["original_stem"], primary)
 
     def test_fail_window_length_is_between_10_and_25(self) -> None:
         """계획서 7.3: FAIL 구간 길이 L 은 10~25 이다."""

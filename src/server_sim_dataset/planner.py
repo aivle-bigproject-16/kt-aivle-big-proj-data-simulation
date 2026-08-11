@@ -323,18 +323,13 @@ def _stratum(rows: list[dict[str, Any]], modality: str) -> str:
     return "clean"
 
 
-def _first_contiguous_labeled_window(
+def _first_ordered_labeled_window(
     items: list[dict[str, Any]], flag: str, length: int = RGB_COUNT
 ) -> list[dict[str, Any]] | None:
-    """Return the earliest index-contiguous window carrying the requested label."""
+    """Return the earliest ordered window carrying the requested label."""
     ordered = sorted(items, key=lambda row: row["original_index"])
     for start in range(len(ordered) - length + 1):
         window = ordered[start:start + length]
-        if any(
-            right["original_index"] != left["original_index"] + 1
-            for left, right in zip(window, window[1:])
-        ):
-            continue
         if any(row[flag] for row in window):
             return window
     return None
@@ -348,7 +343,7 @@ def _select_rgb(
     for role, flag in (("pollution", "has_pollution"), ("damaged", "has_damaged")):
         candidates = []
         for battery_id, items in sorted(grouped.items()):
-            window = _first_contiguous_labeled_window(items, flag)
+            window = _first_ordered_labeled_window(items, flag)
             if window is not None:
                 candidates.append((battery_id, window))
         role_candidates[role] = candidates
@@ -402,27 +397,32 @@ def _select_rgb(
     return selections
 
 
-def _contiguous_windows(
+def _ordered_distinct_windows(
     items: list[dict[str, Any]], length: int, limit: int
 ) -> list[list[dict[str, Any]]]:
-    """Return up to ``limit`` distinct index-contiguous windows in source order."""
+    """Choose distinct, spread-out windows without requiring adjacent indexes.
+
+    Missing raw indexes are valid and are recorded later as sequence gaps.  A
+    reused source may share some rows when it does not contain enough data for
+    disjoint windows, but the complete selected index tuple is never repeated.
+    """
     ordered = sorted(items, key=lambda row: row["original_index"])
-    result: list[list[dict[str, Any]]] = []
-    run_start = 0
-    for position in range(1, len(ordered) + 1):
-        run_ended = (
-            position == len(ordered)
-            or ordered[position]["original_index"] != ordered[position - 1]["original_index"] + 1
+    maximum_start = len(ordered) - length
+    if maximum_start < 0 or limit < 1:
+        return []
+    available = list(range(maximum_start + 1))
+    starts: list[int] = []
+    while available and len(starts) < limit:
+        start = max(
+            available,
+            key=lambda candidate: (
+                min((abs(candidate - chosen) for chosen in starts), default=maximum_start + 1),
+                -candidate,
+            ),
         )
-        if not run_ended:
-            continue
-        run = ordered[run_start:position]
-        for offset in range(0, len(run) - length + 1, length):
-            result.append(run[offset:offset + length])
-            if len(result) == limit:
-                return result
-        run_start = position
-    return result
+        starts.append(start)
+        available.remove(start)
+    return [ordered[start:start + length] for start in starts]
 
 
 def _select(
@@ -493,7 +493,7 @@ def _select(
     for source in normal:
         source_rows = grouped[source.battery_id]
         windows_by_source[source.battery_id] = {
-            axis: _contiguous_windows(
+            axis: _ordered_distinct_windows(
                 [
                     row for row in source_rows
                     if row["axis"] == axis and not row["has_porosity"]
@@ -531,8 +531,8 @@ def _select(
                 for axis_windows in windows_by_source.values()
             )
             raise ValueError(
-                f"CT: {normal_needed} normal output IDs require distinct non-overlapping "
-                f"contiguous windows, but eligible source capacity is {total_capacity}"
+                f"CT: {normal_needed} normal output IDs require distinct "
+                f"ordered windows, but eligible source capacity is {total_capacity}"
             )
     chosen = defective[:defective_needed] + repeated_normal
     # 불량 ID 를 먼저 배치해 출력 ID 번호가 제품 상태와 무관하게 흩어지지 않도록 한다.
@@ -659,7 +659,9 @@ def _configuration(seed: int) -> dict[str, Any]:
         "ct_porosity_limit": CT_POROSITY_LIMIT,
         "ct_positive_rate_bins": [[name, low, high] for name, low, high in CT_POSITIVE_RATE_BINS],
         "defective_id_counts": DEFECTIVE_ID_COUNTS,
-        "ct_normal_source_reuse": "deterministic-round-robin-with-output-instance-seed",
+        "ct_normal_source_reuse": (
+            "capacity-aware-round-robin-with-ordered-distinct-windows-and-output-instance-seed"
+        ),
         "rgb_defective_id_roles": ["pollution", "damaged"],
         "fail_length_range": list(FAIL_LENGTH_RANGE),
         "normal_augmentations": {key: list(value) for key, value in NORMAL_AUGMENTATIONS.items()},

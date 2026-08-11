@@ -108,7 +108,9 @@ def _ct_rows() -> list[tuple[Any, ...]]:
     for battery_id in CT_NORMAL_IDS:
         for axis, count in CT_NORMAL_POOL.items():
             for index in range(count):
-                rows.append(_row("CT", battery_id, axis, index))
+                # Raw CT indexes may contain gaps; ordering, not numeric
+                # adjacency, defines the slice sequence.
+                rows.append(_row("CT", battery_id, axis, index * 2))
     return rows
 
 
@@ -116,17 +118,17 @@ def _rgb_rows() -> list[tuple[Any, ...]]:
     rows: list[tuple[Any, ...]] = []
     for index in range(RGB_DEFECT_POOL):
         # 5 프레임 중 4 개는 Pollution 단독, 1 개는 동시 결함.
-        rows.append(_row("RGB", RGB_POLLUTION_ID, "", index,
+        rows.append(_row("RGB", RGB_POLLUTION_ID, "", index * 2,
                          pollution=True, damaged=index % 5 == 4))
     for index in range(RGB_DEFECT_POOL):
         # 짝수는 동시 결함, 홀수는 Damaged 단독.
-        rows.append(_row("RGB", RGB_MIXED_ID, "", index,
+        rows.append(_row("RGB", RGB_MIXED_ID, "", index * 2,
                          damaged=True, pollution=index % 2 == 0))
     for index in range(RGB_DEFECT_POOL):
-        rows.append(_row("RGB", RGB_SPARE_ID, "", index, pollution=True))
+        rows.append(_row("RGB", RGB_SPARE_ID, "", index * 2, pollution=True))
     for battery_id in RGB_NORMAL_IDS:
         for index in range(RGB_NORMAL_POOL):
-            rows.append(_row("RGB", battery_id, "", index))
+            rows.append(_row("RGB", battery_id, "", index * 2))
     return rows
 
 

@@ -163,7 +163,7 @@ class SelectionTests(PlannerFixture):
             })
             self.assertEqual(len(signatures), output_count)
 
-    def test_reused_ct_source_uses_distinct_contiguous_index_windows(self) -> None:
+    def test_reused_ct_source_uses_distinct_ordered_index_windows_with_gaps(self) -> None:
         initial = [
             row for row in self.plan_rows
             if row["modality"] == "CT"
@@ -181,22 +181,41 @@ class SelectionTests(PlannerFixture):
             for axes in outputs.values():
                 for axis, indexes in axes.items():
                     ordered = sorted(indexes)
-                    self.assertTrue(all(right == left + 1 for left, right in zip(ordered, ordered[1:])))
+                    self.assertTrue(all(right > left for left, right in zip(ordered, ordered[1:])))
                     signatures[axis].add(tuple(ordered))
             for axis, windows in signatures.items():
                 self.assertEqual(len(windows), len(outputs), axis)
-            for axis in signatures:
-                index_sets = [
-                    set(indexes)
-                    for axes in outputs.values()
-                    for name, indexes in axes.items()
-                    if name == axis
-                ]
-                self.assertEqual(
-                    len(set().union(*index_sets)),
-                    sum(len(indexes) for indexes in index_sets),
-                    axis,
-                )
+
+    def test_ct_index_gaps_match_the_raw_index_difference(self) -> None:
+        groups = defaultdict(list)
+        for row in self.plan_rows:
+            if row["modality"] == "CT" and row["capture_set"] == "initial_capture":
+                groups[(row["output_battery_id"], row["axis"])].append(row)
+        observed_gap = False
+        for key, rows in groups.items():
+            ordered = sorted(rows, key=lambda row: int(row["source_sequence_order"]))
+            previous = None
+            for row in ordered:
+                current = int(row["original_index"])
+                gap_size = 0 if previous is None else max(0, current - previous - 1)
+                self.assertEqual(int(row["index_gap_before"]), int(bool(gap_size)), key)
+                self.assertEqual(int(row["index_gap_size"]), gap_size, key)
+                observed_gap = observed_gap or bool(gap_size)
+                previous = current
+        self.assertTrue(observed_gap)
+
+    def test_ordered_windows_accept_consecutive_and_gapped_indexes(self) -> None:
+        helper = planner._ordered_distinct_windows
+        consecutive = [{"original_index": index} for index in range(6)]
+        mixed = [{"original_index": index} for index in (0, 1, 7, 9, 10, 19)]
+        self.assertEqual(
+            [[row["original_index"] for row in window] for window in helper(consecutive, 3, 2)],
+            [[0, 1, 2], [3, 4, 5]],
+        )
+        self.assertEqual(
+            [[row["original_index"] for row in window] for window in helper(mixed, 3, 2)],
+            [[0, 1, 7], [9, 10, 19]],
+        )
 
     def test_ct_defective_window_is_chosen_for_defect_ratio(self) -> None:
         """F-07, 계획서 4.5 의 4 항.

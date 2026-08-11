@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# 이 도구는 v1.2 의 cache CSV 스키마(image_stem 컬럼)와 "20 개 중 1 개 불량" 규칙을
+# 전제한다. v1.3 은 cache v2 와 층화 배분을 쓰므로 둘 다 맞지 않는다. 계획서 11.2 의
+# raw_extraction_feasibility.json 은 reports.feasibility_audit 가 만든다. 그쪽은 planner 의
+# 층 배정과 배분 함수를 직접 불러 쓰므로 선정 로직과 어긋날 수 없다.
+
 import argparse
 import csv
 import json

@@ -12,7 +12,11 @@ from pathlib import Path
 from server_sim_dataset import planner
 from server_sim_dataset.schema import MANIFEST_COLUMNS, ct_axis_transform
 
-from _synthetic import CT_DEFECT_ID, RGB_MIXED_ID, RGB_POLLUTION_ID, build_synthetic_cache
+from _synthetic import (
+    CT_DEFECT_ID,
+    CT_NORMAL_IDS,
+    build_synthetic_cache,
+)
 
 
 # 정본 목록은 schema.MANIFEST_COLUMNS 다. 여기서는 목록이 통째로 사라지거나 줄어드는
@@ -77,22 +81,24 @@ class QuantityTests(PlannerFixture):
         self.assertEqual(Counter(row["stratum"] for row in ids), Counter({"zero": 19, "low_mid": 1}))
         self.assertEqual(sum(1 for row in ids if row["product_status"] == "defective"), 1)
 
-    def test_rgb_preserves_the_defect_class_composition(self) -> None:
-        """The two defective IDs retain the requested three-class composition."""
-        initial = [row for row in self.plan_rows
-                   if row["modality"] == "RGB" and row["capture_set"] == "initial_capture"]
-        composition = Counter()
-        for row in initial:
-            damaged, pollution = row["has_damaged"] == "1", row["has_pollution"] == "1"
-            composition["both" if damaged and pollution else
-                        "damaged_only" if damaged else
-                        "pollution_only" if pollution else "clean"] += 1
-        defects = sum(count for kind, count in composition.items() if kind != "clean")
-        self.assertGreater(composition["damaged_only"], 0, "Damaged 단독 이미지가 하나도 없다")
-        for kind, share in planner.RGB_DEFECT_COMPOSITION.items():
-            self.assertAlmostEqual(composition[kind] / defects, share, places=2, msg=kind)
+    def test_rgb_selects_one_pollution_carrier_and_one_damaged_carrier(self) -> None:
+        defective = [
+            row for row in self.selected_rows
+            if row["modality"] == "RGB" and row["product_status"] == "defective"
+        ]
+        self.assertEqual(len(defective), 2)
+        self.assertEqual({row["defect_role"] for row in defective}, {"pollution", "damaged"})
+        self.assertEqual(len({row["original_battery_id"] for row in defective}), 2)
+        for selected in defective:
+            flag = "has_pollution" if selected["defect_role"] == "pollution" else "has_damaged"
+            rows = [
+                row for row in self.plan_rows
+                if row["capture_set"] == "initial_capture"
+                and row["output_battery_id"] == selected["output_battery_id"]
+            ]
+            self.assertTrue(any(row[flag] == "1" for row in rows))
 
-    def test_rgb_defective_ids_are_the_composition_carriers(self) -> None:
+    def test_rgb_uses_two_defective_output_ids(self) -> None:
         counts = Counter(
             (row["modality"], row["product_status"])
             for row in self.selected_rows
@@ -101,9 +107,6 @@ class QuantityTests(PlannerFixture):
         self.assertEqual(counts[("CT", "normal")], 19)
         self.assertEqual(counts[("RGB", "defective")], 2)
         self.assertEqual(counts[("RGB", "normal")], 18)
-        ids = {int(row["original_battery_id"]) for row in self.selected_rows
-               if row["modality"] == "RGB" and row["product_status"] == "defective"}
-        self.assertEqual(ids, {RGB_POLLUTION_ID, RGB_MIXED_ID})
 
     def test_capture_quality_is_stratified_across_product_status(self) -> None:
         """계획서 v1.5 §7: FAIL 대상을 제품 상태별로 하나씩 고른다.
@@ -124,6 +127,77 @@ class QuantityTests(PlannerFixture):
                     )
 
 class SelectionTests(PlannerFixture):
+    def test_ct_reuses_normal_sources_to_fill_nineteen_output_ids(self) -> None:
+        normal = [
+            row for row in self.selected_rows
+            if row["modality"] == "CT" and row["product_status"] == "normal"
+        ]
+        self.assertEqual(len(normal), 19)
+        self.assertEqual(len({row["original_battery_id"] for row in normal}), len(CT_NORMAL_IDS))
+        self.assertEqual(len({row["output_battery_id"] for row in normal}), 19)
+        self.assertTrue(any(int(row["source_reuse_total"]) > 1 for row in normal))
+
+        initial = [
+            row for row in self.plan_rows
+            if row["modality"] == "CT"
+            and row["product_status"] == "normal"
+            and row["capture_set"] == "initial_capture"
+        ]
+        seeds_by_output = {
+            row["output_battery_id"]: row["normal_augmentation_seed"] for row in initial
+        }
+        groups_by_output = defaultdict(set)
+        signatures_by_source = defaultdict(set)
+        for row in initial:
+            groups_by_output[row["output_battery_id"]].add(row["capture_group_id"])
+            signatures_by_source[row["original_battery_id"]].add((
+                row["base_augmentation_names"],
+                row["normal_augmentation_parameters"],
+            ))
+        self.assertEqual(len(set(seeds_by_output.values())), 19)
+        self.assertEqual(sum(len(groups) for groups in groups_by_output.values()), len(initial))
+        for source_id, signatures in signatures_by_source.items():
+            output_count = len({
+                row["output_battery_id"] for row in initial
+                if row["original_battery_id"] == source_id
+            })
+            self.assertEqual(len(signatures), output_count)
+
+    def test_reused_ct_source_uses_distinct_contiguous_index_windows(self) -> None:
+        initial = [
+            row for row in self.plan_rows
+            if row["modality"] == "CT"
+            and row["product_status"] == "normal"
+            and row["capture_set"] == "initial_capture"
+        ]
+        by_source = defaultdict(lambda: defaultdict(dict))
+        for row in initial:
+            axes = by_source[row["original_battery_id"]][row["output_battery_id"]]
+            axes.setdefault(row["axis"], []).append(int(row["original_index"]))
+        for outputs in by_source.values():
+            if len(outputs) < 2:
+                continue
+            signatures = defaultdict(set)
+            for axes in outputs.values():
+                for axis, indexes in axes.items():
+                    ordered = sorted(indexes)
+                    self.assertTrue(all(right == left + 1 for left, right in zip(ordered, ordered[1:])))
+                    signatures[axis].add(tuple(ordered))
+            for axis, windows in signatures.items():
+                self.assertEqual(len(windows), len(outputs), axis)
+            for axis in signatures:
+                index_sets = [
+                    set(indexes)
+                    for axes in outputs.values()
+                    for name, indexes in axes.items()
+                    if name == axis
+                ]
+                self.assertEqual(
+                    len(set().union(*index_sets)),
+                    sum(len(indexes) for indexes in index_sets),
+                    axis,
+                )
+
     def test_ct_defective_window_is_chosen_for_defect_ratio(self) -> None:
         """F-07, 계획서 4.5 의 4 항.
 

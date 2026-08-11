@@ -336,6 +336,7 @@ def feasibility_audit(cache_path: Path, path: Path) -> None:
         except ValueError as exc:
             selection_error = str(exc)
         selected_status = Counter(item.product_status for item in selected)
+        selected_source_counts = Counter(item.battery_id for item in selected)
         ok = (
             len(selected) == SELECTED_IDS
             and selected_status["defective"] == DEFECTIVE_ID_COUNTS[modality]
@@ -347,6 +348,12 @@ def feasibility_audit(cache_path: Path, path: Path) -> None:
             "eligible_ids": sum(eligible.values()),
             "eligible_by_stratum": dict(sorted(eligible.items())),
             "selected_by_status": dict(sorted(selected_status.items())),
+            "selected_unique_source_ids": len(selected_source_counts),
+            "reused_source_ids": {
+                str(battery_id): count
+                for battery_id, count in sorted(selected_source_counts.items())
+                if count > 1
+            },
             "target_defective_ids": DEFECTIVE_ID_COUNTS[modality],
             "normal_candidate_count": normal_candidates,
             "defective_candidate_count": defective_candidates,

@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import csv
-import itertools
 import json
 import logging
 import random
 import sqlite3
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -43,14 +42,11 @@ DEFECT_FLAGS = {"CT": ("has_porosity",), "RGB": ("has_damaged", "has_pollution")
 # 클래스 구성 목표에 가장 가까운 구간 조합을 찾는다.
 # Product status is fixed by ID count.  This objective applies only to the
 # defect-image classes inside the two selected defective RGB IDs.
-RGB_DEFECT_COMPOSITION = {"pollution_only": 0.40, "both": 0.35, "damaged_only": 0.25}
-RGB_SEARCH_POOL = {"damaged_only": 24, "both": 12, "pollution_only": 12}
-RGB_WINDOWS_PER_ID = 8
 # 계획서 7.3 의 FAIL 구간 길이 L.
 FAIL_LENGTH_RANGE = (10, 25)
 
 SEARCH_ALGORITHM = "deterministic-fixed-id-v1.5"
-SEARCH_STOP_CONDITION = "exhaustive within the recorded bounded ID/profile candidate set"
+SEARCH_STOP_CONDITION = "deterministic label-carrier selection and contiguous-window validation"
 
 
 def _rows(cache_path: Path) -> list[dict[str, Any]]:
@@ -231,6 +227,13 @@ class Selection:
     searched: int = 0
     rejection: str = ""
     reserve: list[tuple[str, list[int]]] = field(default_factory=list)
+    source_reuse_ordinal: int = 1
+    defect_role: str = ""
+
+    @property
+    def instance_key(self) -> tuple[int, int]:
+        """Identity of one output-producing use of a source battery."""
+        return self.battery_id, self.source_reuse_ordinal
 
 
 def _ct_window(
@@ -297,100 +300,6 @@ def _max_defect_run(item: "Selection", modality: str) -> int:
     return max(counts.values(), default=0)
 
 
-def _frame_kind(row: dict[str, Any]) -> str:
-    """RGB 프레임 하나의 결함 조합. 계획서 v1.5 §4.3의 3분류다."""
-    damaged, pollution = bool(row["has_damaged"]), bool(row["has_pollution"])
-    if damaged and pollution:
-        return "both"
-    if damaged:
-        return "damaged_only"
-    if pollution:
-        return "pollution_only"
-    return "clean"
-
-
-def _rgb_window_profiles(items: list[dict[str, Any]]) -> list[tuple[Counter, int]]:
-    """한 ID 의 250 프레임 창들을 결함 조합 구성으로 요약한다.
-
-    구성이 같은 창은 하나로 묶고, 남은 것 중 시작 index 가 작은 쪽을 대표로 삼는다.
-    같은 결과를 주는 창을 전부 들고 조합 탐색에 넣으면 탐색 공간만 커진다.
-    """
-    ordered = sorted(items, key=lambda row: row["original_index"])
-    total = len(ordered)
-    if total < RGB_COUNT:
-        return []
-    kinds = [_frame_kind(row) for row in ordered]
-    prefix = {kind: [0] * (total + 1) for kind in ("pollution_only", "both", "damaged_only")}
-    for position, kind in enumerate(kinds):
-        for name, values in prefix.items():
-            values[position + 1] = values[position] + (1 if kind == name else 0)
-    seen: dict[tuple[int, ...], int] = {}
-    for start in range(total - RGB_COUNT + 1):
-        end = start + RGB_COUNT
-        counts = tuple(prefix[name][end] - prefix[name][start] for name in ("pollution_only", "both", "damaged_only"))
-        if sum(counts) and counts not in seen:
-            seen[counts] = start
-    profiles = [(Counter(dict(zip(("pollution_only", "both", "damaged_only"), counts))), start)
-                for counts, start in seen.items()]
-    profiles.sort(key=lambda item: item[1])
-    return profiles[:RGB_WINDOWS_PER_ID]
-
-
-def _rgb_defect_search(
-    grouped: dict[int, list[dict[str, Any]]],
-) -> tuple[list[tuple[int, int]], dict[str, Any]]:
-    """두 제품불량 ID의 클래스 구성 목표에 가장 가까운 후보 조합을 찾는다.
-
-    후보 전체로 조합을 열거하면 500 개 가까운 ID 에 대해 조합 폭발이 일어난다. 구성
-    요소별로 기여가 큰 ID 만 남겨 탐색 대상을 줄이고, 그 안에서 2개 ID 조합을 전수
-    조사한다. 계획서 4.4 가 요구하는 대로 "절대 최적"이 아니라 "탐색된 후보 중 목적함수
-    최소"로 기록한다.
-    """
-    profiles = {battery_id: _rgb_window_profiles(items) for battery_id, items in grouped.items()}
-    profiles = {battery_id: value for battery_id, value in profiles.items() if value}
-    pool: list[int] = []
-    for component, size in RGB_SEARCH_POOL.items():
-        ranked = sorted(profiles, key=lambda bid: (-max(counts[component] for counts, _ in profiles[bid]), bid))
-        pool.extend(ranked[:size])
-    pool = list(dict.fromkeys(pool))
-
-    best: tuple[tuple[float, ...], list[tuple[int, int]], Counter] | None = None
-    examined = 0
-    for combination in itertools.combinations(pool, DEFECTIVE_ID_COUNTS["RGB"]):
-        for picks in itertools.product(*(profiles[bid] for bid in combination)):
-            examined += 1
-            totals: Counter = Counter()
-            for counts, _ in picks:
-                totals.update(counts)
-            frames = sum(totals.values())
-            deviation = max(
-                abs(totals[name] / frames - share)
-                for name, share in RGB_DEFECT_COMPOSITION.items()
-            )
-            key = (
-                round(deviation, 6),
-                -frames,
-                stable_seed(GLOBAL_SEED, "RGB", *sorted(combination)),
-            )
-            if best is None or key < best[0]:
-                best = (key, [(bid, start) for bid, (_, start) in zip(combination, picks)], totals)
-    if best is None:
-        raise ValueError(
-            "RGB: no two-ID combination can provide the requested defect classes"
-        )
-    key, chosen, totals = best
-    evidence = {
-        "target_defective_ids": DEFECTIVE_ID_COUNTS["RGB"],
-        "target_composition": RGB_DEFECT_COMPOSITION,
-        "achieved_frames": sum(totals.values()),
-        "achieved_composition": {name: round(totals[name] / sum(totals.values()), 6) for name in RGB_DEFECT_COMPOSITION},
-        "max_deviation_pp": round(key[0] * 100, 4),
-        "combinations_examined": examined,
-        "search_pool": len(pool),
-    }
-    return chosen, evidence
-
-
 def _stratum(rows: list[dict[str, Any]], modality: str) -> str:
     """ID 하나를 원본 통계로 층에 배정한다.
 
@@ -414,21 +323,58 @@ def _stratum(rows: list[dict[str, Any]], modality: str) -> str:
     return "clean"
 
 
-def _select_rgb(grouped: dict[int, list[dict[str, Any]]], population: Stats) -> list[Selection]:
-    """Select exactly two defective IDs while preserving class composition."""
-    chosen_defective, evidence = _rgb_defect_search(grouped)
+def _first_contiguous_labeled_window(
+    items: list[dict[str, Any]], flag: str, length: int = RGB_COUNT
+) -> list[dict[str, Any]] | None:
+    """Return the earliest index-contiguous window carrying the requested label."""
+    ordered = sorted(items, key=lambda row: row["original_index"])
+    for start in range(len(ordered) - length + 1):
+        window = ordered[start:start + length]
+        if any(
+            right["original_index"] != left["original_index"] + 1
+            for left, right in zip(window, window[1:])
+        ):
+            continue
+        if any(row[flag] for row in window):
+            return window
+    return None
+
+
+def _select_rgb(
+    grouped: dict[int, list[dict[str, Any]]], population: Stats, seed: int
+) -> list[Selection]:
+    """Select distinct Pollution and Damaged carrier IDs without ratio optimization."""
+    role_candidates: dict[str, list[tuple[int, list[dict[str, Any]]]]] = {}
+    for role, flag in (("pollution", "has_pollution"), ("damaged", "has_damaged")):
+        candidates = []
+        for battery_id, items in sorted(grouped.items()):
+            window = _first_contiguous_labeled_window(items, flag)
+            if window is not None:
+                candidates.append((battery_id, window))
+        role_candidates[role] = candidates
+
+    pairs = [
+        (pollution, damaged)
+        for pollution in role_candidates["pollution"]
+        for damaged in role_candidates["damaged"]
+        if pollution[0] != damaged[0]
+    ]
+    if not pairs:
+        raise ValueError("RGB: distinct Pollution and Damaged carrier IDs are required")
+    pollution, damaged = min(
+        pairs,
+        key=lambda pair: stable_seed(seed, "RGB", "label-carriers", pair[0][0], pair[1][0]),
+    )
+
     selections: list[Selection] = []
     used: set[int] = set()
-    for battery_id, start in chosen_defective:
-        ordered = sorted(grouped[battery_id], key=lambda row: row["original_index"])
-        window = ordered[start:start + RGB_COUNT]
+    for role, (battery_id, window) in (("pollution", pollution), ("damaged", damaged)):
         primary, secondary, counted = _objective(window, population, "RGB")
-        composition = Counter(_frame_kind(row) for row in window)
-        stratum = "damaged_only" if composition["damaged_only"] >= composition["both"] else (
-            "both" if composition["both"] >= composition["pollution_only"] else "pollution_only"
-        )
         selections.append(
-            Selection(battery_id, "defective", window, primary, secondary, counted, stratum=stratum)
+            Selection(
+                battery_id, "defective", window, primary, secondary, counted,
+                stratum=_stratum(grouped[battery_id], "RGB"), defect_role=role,
+            )
         )
         used.add(battery_id)
 
@@ -442,7 +388,7 @@ def _select_rgb(grouped: dict[int, list[dict[str, Any]]], population: Stats) -> 
             continue
         normal.append(Selection(battery_id, "normal", window, 0.0, 0.0, 0.0, stratum="clean"))
     # 계획서 4.5 의 6 항: 동일 목적값에서는 전역 seed 로 결정론적으로 선택한다.
-    normal.sort(key=lambda item: stable_seed(GLOBAL_SEED, "RGB", "normal", item.battery_id))
+    normal.sort(key=lambda item: stable_seed(seed, "RGB", "normal", item.battery_id))
     if len(normal) < normal_needed:
         raise ValueError(
             f"RGB: 무결함 ID 가 {len(normal)} 개뿐이라 {normal_needed} 개를 채울 수 없다. 반올림하지 않고 중단한다"
@@ -450,16 +396,38 @@ def _select_rgb(grouped: dict[int, list[dict[str, Any]]], population: Stats) -> 
     selections.extend(normal[:normal_needed])
     selections.sort(key=lambda item: (item.product_status != "defective", item.stratum, item.battery_id))
     LOGGER.info(
-        "RGB target-composition selection: %d defective ids, %d frames, composition %s (max dev %.3fpp, %d combinations)",
-        len(chosen_defective), evidence["achieved_frames"], evidence["achieved_composition"],
-        evidence["max_deviation_pp"], evidence["combinations_examined"],
+        "RGB label-carrier selection: Pollution ID %d, Damaged ID %d",
+        pollution[0], damaged[0],
     )
-    for item in selections:
-        item.evidence = evidence
     return selections
 
 
-def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection], Stats]:
+def _contiguous_windows(
+    items: list[dict[str, Any]], length: int, limit: int
+) -> list[list[dict[str, Any]]]:
+    """Return up to ``limit`` distinct index-contiguous windows in source order."""
+    ordered = sorted(items, key=lambda row: row["original_index"])
+    result: list[list[dict[str, Any]]] = []
+    run_start = 0
+    for position in range(1, len(ordered) + 1):
+        run_ended = (
+            position == len(ordered)
+            or ordered[position]["original_index"] != ordered[position - 1]["original_index"] + 1
+        )
+        if not run_ended:
+            continue
+        run = ordered[run_start:position]
+        for offset in range(0, len(run) - length + 1, length):
+            result.append(run[offset:offset + length])
+            if len(result) == limit:
+                return result
+        run_start = position
+    return result
+
+
+def _select(
+    rows: list[dict[str, Any]], modality: str, seed: int = GLOBAL_SEED
+) -> tuple[list[Selection], Stats]:
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         if row["modality"] != modality:
@@ -472,7 +440,7 @@ def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection],
     free = DEFECT_FREE_STRATA[modality]
 
     if modality == "RGB":
-        return _select_rgb(grouped, population), population
+        return _select_rgb(grouped, population, seed), population
 
     # 층별 모집단을 따로 잡는다. 층화를 해 놓고 목적함수만 전체 모집단과 비교하면 각 층이
     # 전체 평균을 흉내내다가 층 사이 희석이 생긴다.
@@ -509,21 +477,69 @@ def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection],
         item.primary_objective,
         item.secondary_objective,
         item.count_objective,
-        stable_seed(GLOBAL_SEED, modality, item.battery_id),
+        stable_seed(seed, modality, item.battery_id),
     )
     normal.sort(key=sort_key)
     defective.sort(key=sort_key)
     defective_needed = DEFECTIVE_ID_COUNTS[modality]
     normal_needed = SELECTED_IDS - defective_needed
-    if len(defective) < defective_needed or len(normal) < normal_needed:
+    if len(defective) < defective_needed or not normal:
         raise ValueError(
             f"{modality}: fixed ID ratio requires {defective_needed} defective and "
-            f"{normal_needed} normal IDs; eligible counts are "
+            f"{normal_needed} normal output IDs (normal sources may be reused); eligible counts are "
             f"{len(defective)} defective and {len(normal)} normal"
         )
-    chosen = defective[:defective_needed] + normal[:normal_needed]
+    windows_by_source: dict[int, dict[str, list[list[dict[str, Any]]]]] = {}
+    for source in normal:
+        source_rows = grouped[source.battery_id]
+        windows_by_source[source.battery_id] = {
+            axis: _contiguous_windows(
+                [
+                    row for row in source_rows
+                    if row["axis"] == axis and not row["has_porosity"]
+                ],
+                length,
+                normal_needed,
+            )
+            for axis, length in CT_COUNTS.items()
+        }
+
+    reuse_counts: Counter[int] = Counter()
+    repeated_normal: list[Selection] = []
+    while len(repeated_normal) < normal_needed:
+        progress = False
+        for source in normal:
+            reuse_ordinal = reuse_counts[source.battery_id] + 1
+            axis_windows = windows_by_source[source.battery_id]
+            if any(len(axis_windows[axis]) < reuse_ordinal for axis in CT_COUNTS):
+                continue
+            reused_window = [
+                row
+                for axis in CT_COUNTS
+                for row in axis_windows[axis][reuse_ordinal - 1]
+            ]
+            reuse_counts[source.battery_id] = reuse_ordinal
+            repeated_normal.append(
+                replace(source, window=reused_window, source_reuse_ordinal=reuse_ordinal)
+            )
+            progress = True
+            if len(repeated_normal) == normal_needed:
+                break
+        if not progress:
+            total_capacity = sum(
+                min(len(axis_windows[axis]) for axis in CT_COUNTS)
+                for axis_windows in windows_by_source.values()
+            )
+            raise ValueError(
+                f"CT: {normal_needed} normal output IDs require distinct non-overlapping "
+                f"contiguous windows, but eligible source capacity is {total_capacity}"
+            )
+    chosen = defective[:defective_needed] + repeated_normal
     # 불량 ID 를 먼저 배치해 출력 ID 번호가 제품 상태와 무관하게 흩어지지 않도록 한다.
-    chosen.sort(key=lambda item: (item.product_status != "defective", item.stratum, item.battery_id))
+    chosen.sort(key=lambda item: (
+        item.product_status != "defective", item.stratum,
+        item.battery_id, item.source_reuse_ordinal,
+    ))
     LOGGER.info(
         "%s fixed-status selection: %s (defective %d/%d)",
         modality,
@@ -643,9 +659,8 @@ def _configuration(seed: int) -> dict[str, Any]:
         "ct_porosity_limit": CT_POROSITY_LIMIT,
         "ct_positive_rate_bins": [[name, low, high] for name, low, high in CT_POSITIVE_RATE_BINS],
         "defective_id_counts": DEFECTIVE_ID_COUNTS,
-        "rgb_defect_composition": RGB_DEFECT_COMPOSITION,
-        "rgb_search_pool": RGB_SEARCH_POOL,
-        "rgb_windows_per_id": RGB_WINDOWS_PER_ID,
+        "ct_normal_source_reuse": "deterministic-round-robin-with-output-instance-seed",
+        "rgb_defective_id_roles": ["pollution", "damaged"],
         "fail_length_range": list(FAIL_LENGTH_RANGE),
         "normal_augmentations": {key: list(value) for key, value in NORMAL_AUGMENTATIONS.items()},
         "failure_cases": {key: list(value) for key, value in FAILURE_CASES.items()},
@@ -658,7 +673,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
     selections: dict[str, list[Selection]] = {}
     populations: dict[str, Stats] = {}
     for modality in ("CT", "RGB"):
-        selections[modality], populations[modality] = _select(rows, modality)
+        selections[modality], populations[modality] = _select(rows, modality, seed)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     plan_path = output_dir / "generation_plan.csv"
@@ -673,10 +688,11 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
         base = 1_900_000_000 if modality == "CT" else 2_900_000_000
         chosen = selections[modality]
         population = populations[modality]
+        source_reuse_totals = Counter(item.battery_id for item in chosen)
         # 계획서 v1.5 §7: FAIL 대상 2개를 제품 상태별로 하나씩 고른다. 두 개를 한
         # 무더기에서 뽑으면 촬영실패와 제품불량이 겹치는 칸이 비어 버린다. v1.3 산출물이
         # 실제로 그랬다.
-        fail_ids: set[int] = set()
+        fail_ids: set[tuple[int, int]] = set()
         for status in ("defective", "normal"):
             pool = [item for item in chosen if item.product_status == status]
             if status == "defective":
@@ -685,17 +701,25 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 dense = [item for item in pool if _max_defect_run(item, modality) >= FAIL_LENGTH_RANGE[1]]
                 pool = dense or pool
             if pool:
-                fail_ids.add(min(pool, key=lambda item: stable_seed(seed, modality, "fail-target", item.battery_id)).battery_id)
-        for item in sorted(chosen, key=lambda item: stable_seed(seed, modality, "fail-fill", item.battery_id)):
+                target = min(pool, key=lambda item: stable_seed(
+                    seed, modality, "fail-target", *item.instance_key
+                ))
+                fail_ids.add(target.instance_key)
+        for item in sorted(chosen, key=lambda item: stable_seed(
+            seed, modality, "fail-fill", *item.instance_key
+        )):
             if len(fail_ids) >= 2:
                 break
-            fail_ids.add(item.battery_id)
-        windows_by_id = {item.battery_id: item.window for item in chosen}
-        fail_layout: dict[int, dict[str, Any]] = {}
+            fail_ids.add(item.instance_key)
+        windows_by_id = {item.instance_key: item.window for item in chosen}
+        fail_layout: dict[tuple[int, int], dict[str, Any]] = {}
         for item in chosen:
-            if item.battery_id not in fail_ids:
+            item_key = item.instance_key
+            if item_key not in fail_ids:
                 continue
-            rng = random.Random(stable_seed(seed, modality, item.battery_id, "failure-window"))
+            rng = random.Random(stable_seed(
+                seed, modality, *item.instance_key, "failure-window"
+            ))
             flags = DEFECT_FLAGS[modality]
             defect_at = [any(row[flag] for flag in flags) for row in item.window]
             defective_target = item.product_status == "defective"
@@ -728,7 +752,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
             slots = eligible[start:start + length]
             k = rng.choices([1, 2, 3], weights=[0.6, 0.3, 0.1])[0]
             cases = rng.sample(FAILURE_CASES[modality], k)
-            fail_layout[item.battery_id] = {
+            fail_layout[item_key] = {
                 "axis": axis,
                 "start": start,
                 "length": length,
@@ -739,9 +763,13 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
             }
 
         for rank, item in enumerate(chosen, 1):
+            item_key = item.instance_key
             output_battery_id = base + rank
             augmentation_slot = rank - 1
-            probe_seed = stable_seed(seed, modality, item.battery_id, "normal-base")
+            probe_seed = stable_seed(
+                seed, modality, *item.instance_key,
+                output_battery_id, "normal-base",
+            )
             probe_names, _ = _normal_assignment(modality, augmentation_slot, probe_seed)
             # 계획서 6.2: 슬라이스 순서 역전 여부는 ID 단위로 한 번만 결정한다.
             reversed_axes = {
@@ -751,16 +779,19 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 and ct_axis_transform(probe_seed, axis).reverse_slices
             }
             sequence = _sequence_metadata(item.window, modality, reversed_axes)
-            layout = fail_layout.get(item.battery_id)
+            layout = fail_layout.get(item_key)
             selected_records.append({
                 "modality": modality,
                 "rank": rank,
                 "original_battery_id": item.battery_id,
                 "output_battery_id": output_battery_id,
                 "product_status": item.product_status,
+                "defect_role": item.defect_role,
                 "stratum": item.stratum,
-                "fail_target": item.battery_id in fail_ids,
+                "fail_target": item_key in fail_ids,
                 "source_count": len(item.window),
+                "source_reuse_ordinal": item.source_reuse_ordinal,
+                "source_reuse_total": source_reuse_totals[item.battery_id],
                 "search_algorithm": SEARCH_ALGORITHM,
                 "search_seed": seed,
                 "search_iterations": max(1, len(item.window)),
@@ -768,10 +799,6 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 "target_defective_ids": item.evidence.get(
                     "target_defective_ids", DEFECTIVE_ID_COUNTS[modality]
                 ),
-                "target_composition": json.dumps(item.evidence.get("target_composition", {}), sort_keys=True) if item.evidence else "",
-                "achieved_composition": json.dumps(item.evidence.get("achieved_composition", {}), sort_keys=True) if item.evidence else "",
-                "max_deviation_pp": item.evidence.get("max_deviation_pp", ""),
-                "combinations_examined": item.evidence.get("combinations_examined", ""),
                 "primary_objective": round(item.primary_objective, 8),
                 "secondary_objective": round(item.secondary_objective, 8),
                 "annotation_count_objective": round(item.count_objective, 8),
@@ -787,7 +814,10 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
             initial_for_recapture: list[dict[str, Any]] = []
             for slot, row in enumerate(item.window):
                 sample_counter += 1
-                group_seed = stable_seed(seed, modality, item.battery_id, row["axis"], row["original_index"])
+                group_seed = stable_seed(
+                    seed, modality, output_battery_id, *item.instance_key,
+                    row["axis"], row["original_index"],
+                )
                 normal_seed = probe_seed if modality == "CT" else group_seed
                 assignment_slot = augmentation_slot if modality == "CT" else slot
                 augmentations, parameters = _normal_assignment(modality, assignment_slot, normal_seed)
@@ -798,13 +828,15 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                     offset = layout["slots"].index(slot)
                     case_index = min(layout["k"] - 1, offset * layout["k"] // layout["length"])
                     failure_case = layout["cases"][case_index]
-                    failure_segment = f"{modality}-{item.battery_id}-{layout['start']}-{layout['length']}"
+                    failure_segment = (
+                        f"{modality}-{output_battery_id}-{layout['start']}-{layout['length']}"
+                    )
                     for order, (reason, slots) in enumerate(layout["reserve"], 1):
                         reserve_candidates.append(
                             _candidate_record(order, reason, item.window[slots[offset]])
                         )
                     other = next(
-                        (other_id for other_id in fail_ids if other_id != item.battery_id), None
+                        (other_id for other_id in fail_ids if other_id != item_key), None
                     )
                     if other is not None:
                         # 계획서 7.5: 다른 FAIL ID 로 넘어가도 이 ID 의 L 은 유지한다.
@@ -828,7 +860,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                     "sample_id": f"S{sample_counter:08d}",
                     "synthetic_id": output_stem("initial_capture", modality, output_battery_id, row["axis"], row["original_index"]),
                     "capture_set": "initial_capture",
-                    "capture_group_id": f"G{stable_seed(modality, item.battery_id, row['axis'], row['original_index']):016x}",
+                    "capture_group_id": f"G{stable_seed(modality, output_battery_id, row['axis'], row['original_index']):016x}",
                     "retry_of_sample_id": "",
                     "modality": modality,
                     "original_battery_id": item.battery_id,
@@ -871,7 +903,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 plan_records.append(record)
                 initial_for_recapture.append(record)
 
-            if item.battery_id in fail_ids:
+            if item_key in fail_ids:
                 for initial in initial_for_recapture:
                     sample_counter += 1
                     retry = dict(initial)

@@ -24,12 +24,10 @@ from server_sim_dataset.cache import SCHEMA
 
 
 CT_DEFECT_ID = 101
-CT_NORMAL_IDS = tuple(range(102, 121))
+# Realistic shortage: nine eligible normal sources must fill 19 output products.
+CT_NORMAL_IDS = tuple(range(102, 111))
 
-# RGB는 계획서 v1.5 §4.3의 목표 구성 탐색을 태워야 하므로 세 가지 결함 조합을 모두
-# 만들어 둔다. 901 은 Pollution 우세, 902 는 Damaged 단독과 동시 결함 반반, 903 은
-# Pollution 단독뿐이다. 901 과 902 의 앞 250 프레임을 합치면 목표 40/35/25 가 정확히
-# 나오므로, 탐색이 그 조합을 찾아내는지 확인할 수 있다.
+# 여러 라벨 조합을 만들어 서로 다른 Pollution/Damaged 담당 ID를 고를 수 있게 한다.
 RGB_POLLUTION_ID = 901
 RGB_MIXED_ID = 902
 RGB_SPARE_ID = 903
@@ -39,7 +37,7 @@ RGB_NORMAL_IDS = tuple(range(904, 922))
 
 # 결함 ID 는 무결함 구간도 확보할 수 있을 만큼 pool 을 넉넉히 준다.
 CT_DEFECT_POOL = {"x": 400, "y": 900, "z": 900}
-CT_NORMAL_POOL = {"x": 160, "y": 660, "z": 660}
+CT_NORMAL_POOL = {"x": 450, "y": 1950, "z": 1950}
 RGB_DEFECT_POOL = 300
 RGB_NORMAL_POOL = 300
 

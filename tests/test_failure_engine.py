@@ -10,12 +10,17 @@ from PIL import Image
 from server_sim_dataset.generator import _failure_engine, _mask
 
 
-ENGINE_ROOT = Path(os.environ.get("QUALITY_FAIL_ENGINE_ROOT", ""))
+ENGINE_ROOT_VALUE = os.environ.get("QUALITY_FAIL_ENGINE_ROOT")
+ENGINE_ROOT = Path(ENGINE_ROOT_VALUE) if ENGINE_ROOT_VALUE else None
 
 
-@unittest.skipUnless(ENGINE_ROOT.is_dir(), "QUALITY_FAIL_ENGINE_ROOT is not configured")
+@unittest.skipUnless(
+    ENGINE_ROOT is not None and ENGINE_ROOT.is_dir(),
+    "QUALITY_FAIL_ENGINE_ROOT is not configured",
+)
 class FailureEngineIntegrationTests(unittest.TestCase):
     def test_v2_rgb_failure_adapter(self) -> None:
+        assert ENGINE_ROOT is not None
         engine = _failure_engine(ENGINE_ROOT)
         gradient = np.tile(np.arange(256, dtype=np.uint8), (256, 1))
         image = Image.merge("RGB", tuple(Image.fromarray(gradient) for _ in range(3)))

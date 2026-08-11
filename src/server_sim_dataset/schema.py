@@ -60,6 +60,60 @@ GENERATION_COLUMNS: frozenset[str] = frozenset({
 CT_COUNTS = {"x": 150, "y": 650, "z": 650}
 RGB_COUNT = 250
 
+# CT orthogonal-view convention.  The filename suffix establishes the slice
+# coordinate; this table explicitly defines the in-plane orientation, which is
+# not encoded in the filename itself.  Every tuple is
+# (slice coordinate, image horizontal coordinate, image vertical coordinate)
+# in the shared 3-D battery coordinate system.
+CT_AXIS_COORDINATES: dict[str, tuple[str, str, str]] = {
+    "x": ("X", "Y", "Z"),
+    "y": ("Y", "X", "Z"),
+    "z": ("Z", "X", "Y"),
+}
+
+
+@dataclass(frozen=True)
+class CtAxisTransform:
+    """Projection of one ID-level 3-D reflection onto one CT view."""
+
+    flip_horizontal: bool
+    flip_vertical: bool
+    reverse_slices: bool
+
+
+def ct_view_to_voxel(axis: str, slice_position: float, horizontal: float, vertical: float) -> tuple[float, float, float]:
+    """Map one CT view coordinate into the declared shared (X, Y, Z) space."""
+    try:
+        coordinates = CT_AXIS_COORDINATES[axis.lower()]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported CT axis: {axis!r}") from exc
+    values = dict(zip(coordinates, (slice_position, horizontal, vertical)))
+    return values["X"], values["Y"], values["Z"]
+
+
+def ct_axis_transform(id_seed: int, axis: str) -> CtAxisTransform:
+    """Derive a view transform from one shared (X, Y, Z) reflection.
+
+    Bits 0, 1 and 2 represent reflection of global X, Y and Z respectively.
+    The sliced global coordinate controls sequence order; the other two
+    coordinates control the image plane and its polygon coordinates.
+    """
+    try:
+        slice_coordinate, horizontal, vertical = CT_AXIS_COORDINATES[axis.lower()]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported CT axis: {axis!r}") from exc
+    mask = (id_seed & 7) or 1
+    reflected = {
+        "X": bool(mask & 1),
+        "Y": bool(mask & 2),
+        "Z": bool(mask & 4),
+    }
+    return CtAxisTransform(
+        flip_horizontal=reflected[horizontal],
+        flip_vertical=reflected[vertical],
+        reverse_slices=reflected[slice_coordinate],
+    )
+
 
 def sequence_length(modality: str, axis: str) -> int:
     return CT_COUNTS[axis] if modality == "CT" else RGB_COUNT

@@ -271,13 +271,13 @@ def pairing_audit(manifest: list[dict[str, str]], cache_path: Path, output: Path
 def feasibility_audit(cache_path: Path, path: Path) -> None:
     """계획서 11.2 의 `raw_extraction_feasibility.json`.
 
-    원본 전수검사 결과와 모달리티별 후보 수, plan 가능 여부를 기록한다. planner 의 층
-    배정과 배분 함수를 그대로 불러 쓴다. 감사 파일이 실제 선정 로직과 따로 구현되면
+    원본 전수검사 결과와 모달리티별 후보 수, plan 가능 여부를 기록한다. planner의 실제
+    선정 함수를 그대로 호출한다. 감사 파일이 실제 선정 로직과 따로 구현되면
     둘이 어긋나도 아무도 모른다.
     """
     from .planner import (
-        CT_COUNTS, CT_POROSITY_LIMIT, RGB_COUNT, SELECTED_IDS,
-        _allocate, _best_window, _ct_window, _stats, _stratum,
+        CT_COUNTS, CT_POROSITY_LIMIT, DEFECTIVE_ID_COUNTS, RGB_COUNT, SELECTED_IDS,
+        _best_window, _ct_window, _rows, _select, _stats, _stratum,
     )
 
     db = sqlite3.connect(cache_path)
@@ -287,18 +287,20 @@ def feasibility_audit(cache_path: Path, path: Path) -> None:
     finally:
         db.close()
     valid = [row for row in rows if row["status"] == "valid"]
+    canonical = _rows(cache_path)
     invalid = Counter(row["exclusion_reason"] for row in rows if row["status"] == "invalid")
 
     report: dict[str, Any] = {
         "cache_valid_rows": len(valid),
+        "selection_valid_rows": len(canonical),
         "cache_invalid_rows": len(rows) - len(valid),
         "invalid_reasons": dict(invalid.most_common()),
-        "selection_rule": "stratified-proportional-v1.3",
+        "selection_rule": "fixed-defective-id-count-v1.5",
         "selected_ids_per_modality": SELECTED_IDS,
     }
     feasible = True
     for modality in ("CT", "RGB"):
-        pool = [row for row in valid if row["modality"] == modality]
+        pool = [row for row in canonical if row["modality"] == modality]
         if modality == "CT":
             pool = [row for row in pool if row["porosity_bbox_max_ratio"] < CT_POROSITY_LIMIT]
         grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -327,20 +329,32 @@ def feasibility_audit(cache_path: Path, path: Path) -> None:
                 defective_candidates += 1
             else:
                 normal_candidates += 1
-        quota = _allocate(dict(eligible), SELECTED_IDS, dict(eligible)) if eligible else {}
-        ok = sum(quota.values()) == SELECTED_IDS
+        selection_error = ""
+        selected = []
+        try:
+            selected, _ = _select(canonical, modality)
+        except ValueError as exc:
+            selection_error = str(exc)
+        selected_status = Counter(item.product_status for item in selected)
+        ok = (
+            len(selected) == SELECTED_IDS
+            and selected_status["defective"] == DEFECTIVE_ID_COUNTS[modality]
+            and selected_status["normal"] == SELECTED_IDS - DEFECTIVE_ID_COUNTS[modality]
+        )
         feasible = feasible and ok
         report[modality] = {
             "raw_ids": len({row["battery_id"] for row in pool}),
             "eligible_ids": sum(eligible.values()),
             "eligible_by_stratum": dict(sorted(eligible.items())),
-            "allocation": dict(sorted(quota.items())),
+            "selected_by_status": dict(sorted(selected_status.items())),
+            "target_defective_ids": DEFECTIVE_ID_COUNTS[modality],
             "normal_candidate_count": normal_candidates,
             "defective_candidate_count": defective_candidates,
             "population_defect_image_ratio": round(population.defect_image_ratio, 8),
             "population_class_image_ratio": {k: round(v, 8) for k, v in population.class_image_ratio.items()},
             "population_conditional_class_ratio": {k: round(v, 8) for k, v in population.conditional_class_ratio.items()},
             "plan_feasible": ok,
+            "selection_error": selection_error,
         }
     report["plan_feasible"] = feasible
     report["output_id_ranges_disjoint"] = True

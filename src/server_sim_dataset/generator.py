@@ -21,7 +21,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, JpegImagePlugin
 
 from . import __version__
-from .schema import MANIFEST_COLUMNS, iter_defects, output_stem, points, roi_bbox, sequence_length
+from .schema import (
+    MANIFEST_COLUMNS,
+    ct_axis_transform,
+    iter_defects,
+    output_stem,
+    points,
+    roi_bbox,
+    sequence_length,
+)
 from .util import atomic_json, sha256_file, stable_seed
 
 
@@ -110,8 +118,8 @@ class NormalResult:
     """
 
     image: Image.Image
-    flip_x: bool = False
-    flip_y: bool = False
+    flip_horizontal: bool = False
+    flip_vertical: bool = False
     affine: PlaneAffine | None = None
     applied: list[str] = field(default_factory=list)
     retry_reason: str = ""
@@ -213,12 +221,13 @@ def _normal(
             equalized = ImageOps.equalize(out)
             out = Image.blend(out, equalized, float(rng.uniform(0.05, 0.15)))
         elif name == "synchronized_flip":
-            # 계획서 6.2: 반전 여부와 방향은 ID 별로 한 번만 결정한다.
-            result.flip_x = bool(id_seed & 1)
-            result.flip_y = bool(id_seed & 2)
-            if result.flip_x:
+            # One ID-level 3-D reflection is projected onto this orthogonal view.
+            transform = ct_axis_transform(id_seed, axis)
+            result.flip_horizontal = transform.flip_horizontal
+            result.flip_vertical = transform.flip_vertical
+            if result.flip_horizontal:
                 out = ImageOps.mirror(out)
-            if result.flip_y:
+            if result.flip_vertical:
                 out = ImageOps.flip(out)
         elif name == "safe_translate_rotate":
             affine, reason = _safe_affine(out, rng, geometry)
@@ -415,7 +424,7 @@ def _render(raw_root: Path, row: dict[str,str], source: dict[str,Any], *, strict
     width, height = normal.image.size
     defects = _update_annotations(
         payload, width, height, offset=offset,
-        flip_x=normal.flip_x, flip_y=normal.flip_y, affine=normal.affine,
+        flip_x=normal.flip_horizontal, flip_y=normal.flip_vertical, affine=normal.affine,
     )
     outline = points((payload.get("swelling") or {}).get("battery_outline"))
     return Rendered(normal.image, payload, defects, normal, outline, quantization, subsampling)
@@ -517,7 +526,14 @@ def _generate_one(task: tuple[Any, ...]) -> tuple[dict[str, Any], int, int]:
         "normal_parameters": json.loads(row["normal_augmentation_parameters"]),
         "seed": int(row["normal_augmentation_seed"]),
         "slice_seed": int(row.get("slice_seed") or row["normal_augmentation_seed"]),
-        "flip": {"x": normal.flip_x, "y": normal.flip_y},
+        "flip": {
+            # Keep x/y aliases for existing sidecar consumers; these are image
+            # coordinates, not global CT X/Y coordinates.
+            "x": normal.flip_horizontal,
+            "y": normal.flip_vertical,
+            "horizontal": normal.flip_horizontal,
+            "vertical": normal.flip_vertical,
+        },
         "retry_reason": normal.retry_reason,
         "failure_case": "",
         "automatic_checks": {"passed": True, "measurements": {}},

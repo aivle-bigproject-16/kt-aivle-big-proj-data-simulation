@@ -1,8 +1,11 @@
-# CT/RGB 서버 시뮬레이션 데이터셋 파이프라인 v1.3
+# CT/RGB 서버 시뮬레이션 데이터셋 파이프라인 v1.5
 
-`시뮬레이션_데이터셋_생성_계획서_v1.2(2026-08-05).md`를 구현한 독립 코드다. v1.2 산출물의
-점검 결과와 v1.3에서 고친 내용은 `시뮬레이션_파이프라인_수정계획서_v1.3(2026-08-10).md`에
-있다.
+실행 정본은 `시뮬레이션_데이터셋_생성_계획서_v1.5(2026-08-11).md`다. 이전 v1.2 생성
+계획서와 v1.3 수정계획서는 변경 이력과 근거 확인용으로 보존한다.
+
+v1.5는 CT 파일명의 x/y/z를 공통 3-D 좌표계에 매핑해 이미지·폴리곤 반전과 슬라이스
+순서를 하나의 ID 단위 변환에서 파생한다. 제품 상태는 이미지 수가 아니라 ID 수로 고정하며,
+CT는 불량 1/20·정상 19/20, RGB는 불량 2/20·정상 18/20이다.
 
 라벨은 원본 폴더에 풀려 있는 `.json`만 읽는다. TAR·ZIP 등 압축파일은 열거나 fallback으로
 사용하지 않는다.
@@ -148,16 +151,16 @@ JSON에 오류 종류와 메시지가 남는다.
 gdrive:AIVLE_BigProject/data_simulation/<산출물폴더>
 ```
 
-버전별 하위 폴더를 쓰고 기존 버전은 덮어쓰지 않는다. 예: `server-simulation-v1.2-zips`,
-`server-simulation-v1.3-zips`.
+버전별 하위 폴더를 쓰고 기존 버전은 덮어쓰지 않는다. 예: `server-simulation-v1.4-zips`,
+`server-simulation-v1.5-zips`.
 
 ```powershell
 rclone lsd gdrive:                                  # 최상위 폴더명을 눈으로 확인한다
 rclone copy ".\work\output" `
-  "gdrive:AIVLE_BigProject/data_simulation/server-simulation-v1.3-zips" `
+  "gdrive:AIVLE_BigProject/data_simulation/server-simulation-v1.5-zips" `
   --include "*.zip" --max-depth 1 --transfers 4 -P
 rclone check ".\work\output" `
-  "gdrive:AIVLE_BigProject/data_simulation/server-simulation-v1.3-zips" `
+  "gdrive:AIVLE_BigProject/data_simulation/server-simulation-v1.5-zips" `
   --include "*.zip" --max-depth 1 --one-way
 ```
 

@@ -1,10 +1,4 @@
-"""planner 회귀 테스트.
-
-수정계획서 v1.3 의 S2 단계에서 구현보다 먼저 작성했다. v1.3 구현이 끝나기 전에는
-일부가 실패하는 것이 정상이며, 실패 목록이 곧 구현의 완료 기준이다.
-
-각 테스트에는 대응하는 결함 ID 와 계획서 조항을 적어 둔다.
-"""
+"""계획서 v1.5 planner 회귀 테스트."""
 
 from __future__ import annotations
 
@@ -16,7 +10,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from server_sim_dataset import planner
-from server_sim_dataset.schema import MANIFEST_COLUMNS
+from server_sim_dataset.schema import MANIFEST_COLUMNS, ct_axis_transform
 
 from _synthetic import CT_DEFECT_ID, RGB_MIXED_ID, RGB_POLLUTION_ID, build_synthetic_cache
 
@@ -55,6 +49,14 @@ class PlannerFixture(unittest.TestCase):
 
 
 class QuantityTests(PlannerFixture):
+    def test_v15_configuration_records_id_targets_and_ct_coordinates(self) -> None:
+        settings = planner._configuration(planner.GLOBAL_SEED)
+        self.assertEqual(settings["defective_id_counts"], {"CT": 1, "RGB": 2})
+        self.assertEqual(
+            settings["ct_axis_coordinates"],
+            {"x": ("X", "Y", "Z"), "y": ("Y", "X", "Z"), "z": ("Z", "X", "Y")},
+        )
+
     def test_plan_quantities_match_section_13_1(self) -> None:
         counts = Counter(row["capture_set"] for row in self.plan_rows)
         self.assertEqual(counts["initial_capture"], 34000)
@@ -68,23 +70,15 @@ class QuantityTests(PlannerFixture):
         self.assertEqual(rgb, set(range(2_900_000_001, 2_900_000_021)))
         self.assertEqual(ct & rgb, set())
 
-    def test_ct_allocation_follows_the_eligible_distribution(self) -> None:
-        """계획서 4.5: CT 는 원본 ID 의 층 분포에 비례해 배분한다.
-
-        이 fixture 는 적격 CT ID 가 정확히 20 개이므로 배분은 전부를 뽑는 것과 같다.
-        """
+    def test_ct_uses_one_defective_and_nineteen_normal_ids(self) -> None:
+        """계획서 v1.5 §4.1: CT 제품 상태를 ID 개수로 고정한다."""
         ids = [row for row in self.selected_rows if row["modality"] == "CT"]
         self.assertEqual(len(ids), 20)
         self.assertEqual(Counter(row["stratum"] for row in ids), Counter({"zero": 19, "low_mid": 1}))
         self.assertEqual(sum(1 for row in ids if row["product_status"] == "defective"), 1)
 
-    def test_rgb_hits_the_target_defect_rate_and_composition(self) -> None:
-        """계획서 4.5(v1.4): RGB 는 목표 결함률과 3 분류 구성으로 뽑는다.
-
-        RGB 결함은 배터리 단위라 250 프레임 창이 사실상 전부 결함이거나 전부 무결함이다.
-        층 비례로는 결함률이 5% 단위로만 움직이고 클래스 구성은 통제할 수 없다. v1.3
-        산출물에서 `Damaged` 단독 이미지가 0 장이었던 것이 그 결과다.
-        """
+    def test_rgb_preserves_the_defect_class_composition(self) -> None:
+        """The two defective IDs retain the requested three-class composition."""
         initial = [row for row in self.plan_rows
                    if row["modality"] == "RGB" and row["capture_set"] == "initial_capture"]
         composition = Counter()
@@ -94,18 +88,25 @@ class QuantityTests(PlannerFixture):
                         "damaged_only" if damaged else
                         "pollution_only" if pollution else "clean"] += 1
         defects = sum(count for kind, count in composition.items() if kind != "clean")
-        self.assertAlmostEqual(defects / len(initial), planner.RGB_DEFECT_RATE, places=3)
         self.assertGreater(composition["damaged_only"], 0, "Damaged 단독 이미지가 하나도 없다")
         for kind, share in planner.RGB_DEFECT_COMPOSITION.items():
             self.assertAlmostEqual(composition[kind] / defects, share, places=2, msg=kind)
 
     def test_rgb_defective_ids_are_the_composition_carriers(self) -> None:
+        counts = Counter(
+            (row["modality"], row["product_status"])
+            for row in self.selected_rows
+        )
+        self.assertEqual(counts[("CT", "defective")], 1)
+        self.assertEqual(counts[("CT", "normal")], 19)
+        self.assertEqual(counts[("RGB", "defective")], 2)
+        self.assertEqual(counts[("RGB", "normal")], 18)
         ids = {int(row["original_battery_id"]) for row in self.selected_rows
                if row["modality"] == "RGB" and row["product_status"] == "defective"}
         self.assertEqual(ids, {RGB_POLLUTION_ID, RGB_MIXED_ID})
 
     def test_capture_quality_is_stratified_across_product_status(self) -> None:
-        """계획서 7.1(v1.4): FAIL 대상을 제품 상태별로 하나씩 고른다.
+        """계획서 v1.5 §7: FAIL 대상을 제품 상태별로 하나씩 고른다.
 
         v1.3 산출물에는 촬영실패이면서 제품불량인 이미지가 한 장도 없었다. 두 축이
         독립이라고 규정해 놓고 교차 칸이 비면 그 조합을 학습에도 평가에도 쓸 수 없다.
@@ -121,18 +122,6 @@ class QuantityTests(PlannerFixture):
                         table[(quality, defective)], 0,
                         f"{modality} {quality}/{'불량' if defective else '정상'} 칸이 비었다",
                     )
-
-    def test_allocation_is_proportional_and_respects_supply(self) -> None:
-        """배분은 최대잉여법이고, 후보가 모자란 층의 몫은 다른 층으로 넘어간다."""
-        available = {"a": 50, "b": 30, "c": 20}
-        self.assertEqual(planner._allocate(available, 10, available), {"a": 5, "b": 3, "c": 2})
-        supply = {"a": 50, "b": 1, "c": 20}
-        result = planner._allocate(available, 10, supply)
-        self.assertEqual(result["b"], 1)
-        self.assertEqual(sum(result.values()), 10)
-        for name, count in result.items():
-            self.assertLessEqual(count, supply[name])
-
 
 class SelectionTests(PlannerFixture):
     def test_ct_defective_window_is_chosen_for_defect_ratio(self) -> None:
@@ -212,6 +201,31 @@ class AugmentationAssignmentTests(PlannerFixture):
         for battery_id, names in by_id.items():
             self.assertEqual(len(names), 1, f"CT {battery_id} 에 증강 종류가 여러 개 배정되었다")
 
+    def test_ct_slice_order_comes_from_the_same_3d_transform_as_plane_flips(self) -> None:
+        rows = [
+            row for row in self.plan_rows
+            if row["modality"] == "CT"
+            and row["capture_set"] == "initial_capture"
+            and "synchronized_flip" in json.loads(row["base_augmentation_names"])
+        ]
+        self.assertTrue(rows)
+        ids = {row["output_battery_id"] for row in rows}
+        for battery_id in ids:
+            for axis in ("x", "y", "z"):
+                axis_rows = sorted(
+                    (
+                        row for row in rows
+                        if row["output_battery_id"] == battery_id and row["axis"] == axis
+                    ),
+                    key=lambda row: int(row["source_sequence_order"]),
+                )
+                seed = int(axis_rows[0]["normal_augmentation_seed"])
+                actual_reversed = (
+                    int(axis_rows[0]["output_sequence_order"])
+                    > int(axis_rows[-1]["output_sequence_order"])
+                )
+                self.assertEqual(actual_reversed, ct_axis_transform(seed, axis).reverse_slices)
+
 
 class ReserveTests(PlannerFixture):
     def test_fail_ids_have_ranked_reserve_candidates(self) -> None:
@@ -261,7 +275,7 @@ class ReserveTests(PlannerFixture):
 
 class ManifestSchemaTests(PlannerFixture):
     def test_schema_declares_the_full_column_set(self) -> None:
-        """수정계획서 v1.3 의 5 장이 정의한 72 개다."""
+        """v1.5가 유지하는 72개 기본 manifest 컬럼 계약이다."""
         self.assertEqual(len(MANIFEST_COLUMNS), EXPECTED_COLUMN_COUNT)
         self.assertEqual(len(set(MANIFEST_COLUMNS)), EXPECTED_COLUMN_COUNT, "중복 컬럼이 있다")
 

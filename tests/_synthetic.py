@@ -26,7 +26,7 @@ from server_sim_dataset.cache import SCHEMA
 CT_DEFECT_ID = 101
 CT_NORMAL_IDS = tuple(range(102, 121))
 
-# RGB 는 계획서 4.5(v1.4) 의 목표 구성 탐색을 태워야 하므로 세 가지 결함 조합을 모두
+# RGB는 계획서 v1.5 §4.3의 목표 구성 탐색을 태워야 하므로 세 가지 결함 조합을 모두
 # 만들어 둔다. 901 은 Pollution 우세, 902 는 Damaged 단독과 동시 결함 반반, 903 은
 # Pollution 단독뿐이다. 901 과 902 의 앞 250 프레임을 합치면 목표 40/35/25 가 정확히
 # 나오므로, 탐색이 그 조합을 찾아내는지 확인할 수 있다.

@@ -1,8 +1,4 @@
-"""정상 증강의 기하·연속성 회귀 테스트.
-
-수정계획서 v1.3 의 S2 단계에서 구현보다 먼저 작성했다. v1.2 산출물에서 실제로
-발생한 결함을 재현하는 것이 목적이므로, 구현 전에는 실패한다.
-"""
+"""계획서 v1.5의 CT 3-D 변환 및 정상 증강 회귀 테스트."""
 
 from __future__ import annotations
 
@@ -12,6 +8,7 @@ import unittest
 from PIL import Image, ImageOps
 
 from server_sim_dataset import generator
+from server_sim_dataset.schema import ct_axis_transform, ct_view_to_voxel
 from server_sim_dataset.util import stable_seed
 
 
@@ -46,25 +43,25 @@ class NormalApiTests(unittest.TestCase):
 class SynchronizedFlipTests(unittest.TestCase):
     """F-01. v1.2 에서 CT 4,350 장의 볼륨 방향이 슬라이스마다 뒤바뀐 결함."""
 
-    def _flip_of(self, slice_seed: int, id_seed: int) -> tuple[bool, bool]:
+    def _flip_of(self, slice_seed: int, id_seed: int, axis: str = "x") -> tuple[bool, bool]:
         result = generator._normal(
-            _grayscale(), ["synchronized_flip"], PARAMS, slice_seed, id_seed
+            _grayscale(), ["synchronized_flip"], PARAMS, slice_seed, id_seed, axis=axis
         )
-        return result.flip_x, result.flip_y
+        return result.flip_horizontal, result.flip_vertical
 
     def test_flip_is_constant_across_slices_of_one_id(self) -> None:
         """계획서 6.2: 반전 여부와 방향은 ID 별로 한 번만 결정한다."""
         id_seed = stable_seed(20260723, "CT", 101, "normal-base")
-        observed = {
-            self._flip_of(stable_seed(id_seed, axis, index, "synchronized_flip"), id_seed)
-            for axis in ("x", "y", "z")
-            for index in range(40)
-        }
-        self.assertEqual(
-            len(observed),
-            1,
-            f"한 ID 안에서 반전 방향이 {len(observed)} 종류로 갈렸다: {sorted(observed)}",
-        )
+        for axis in ("x", "y", "z"):
+            observed = {
+                self._flip_of(
+                    stable_seed(id_seed, axis, index, "synchronized_flip"),
+                    id_seed,
+                    axis,
+                )
+                for index in range(40)
+            }
+            self.assertEqual(len(observed), 1, f"{axis} axis changed between slices")
 
     def test_flip_differs_between_ids(self) -> None:
         """ID 단위로 고정하되 ID 사이에서는 달라져야 결정론적 다양성이 유지된다."""
@@ -76,6 +73,75 @@ class SynchronizedFlipTests(unittest.TestCase):
             for battery_id in range(101, 141)
         }
         self.assertGreater(len(observed), 1, "모든 ID 가 같은 방향으로 고정되었다")
+
+    def test_one_3d_flip_is_projected_consistently_to_every_axis(self) -> None:
+        expected = {
+            "x": (True, True, True),
+            "y": (True, True, True),
+            "z": (True, True, True),
+        }
+        for axis, values in expected.items():
+            transform = ct_axis_transform(7, axis)
+            self.assertEqual(
+                (transform.flip_horizontal, transform.flip_vertical, transform.reverse_slices),
+                values,
+            )
+
+    def test_global_x_reflection_changes_only_matching_coordinates(self) -> None:
+        expected = {
+            "x": (False, False, True),
+            "y": (True, False, False),
+            "z": (True, False, False),
+        }
+        for axis, values in expected.items():
+            transform = ct_axis_transform(1, axis)
+            self.assertEqual(
+                (transform.flip_horizontal, transform.flip_vertical, transform.reverse_slices),
+                values,
+            )
+
+    def test_each_view_maps_back_to_the_same_3d_point(self) -> None:
+        self.assertEqual(ct_view_to_voxel("x", 10, 20, 30), (10, 20, 30))
+        self.assertEqual(ct_view_to_voxel("y", 20, 10, 30), (10, 20, 30))
+        self.assertEqual(ct_view_to_voxel("z", 30, 10, 20), (10, 20, 30))
+
+    def test_synchronized_flip_never_resolves_to_the_identity(self) -> None:
+        transforms = [ct_axis_transform(0, axis) for axis in ("x", "y", "z")]
+        self.assertTrue(
+            any(
+                transform.flip_horizontal
+                or transform.flip_vertical
+                or transform.reverse_slices
+                for transform in transforms
+            )
+        )
+
+    def test_all_global_reflections_project_to_one_shared_voxel(self) -> None:
+        point = (2.0, 3.0, 4.0)
+        limits = (10.0, 20.0, 30.0)
+        views = {
+            "x": (point[0], point[1], point[2], limits[0], limits[1], limits[2]),
+            "y": (point[1], point[0], point[2], limits[1], limits[0], limits[2]),
+            "z": (point[2], point[0], point[1], limits[2], limits[0], limits[1]),
+        }
+        for mask in range(1, 8):
+            expected = tuple(
+                limit - value if mask & (1 << coordinate) else value
+                for coordinate, (value, limit) in enumerate(zip(point, limits))
+            )
+            for axis, (slice_pos, horizontal, vertical, slice_max, width, height) in views.items():
+                transform = ct_axis_transform(mask, axis)
+                if transform.reverse_slices:
+                    slice_pos = slice_max - slice_pos
+                if transform.flip_horizontal:
+                    horizontal = width - horizontal
+                if transform.flip_vertical:
+                    vertical = height - vertical
+                self.assertEqual(
+                    ct_view_to_voxel(axis, slice_pos, horizontal, vertical),
+                    expected,
+                    (mask, axis),
+                )
 
 
 class PolygonTransformTests(unittest.TestCase):

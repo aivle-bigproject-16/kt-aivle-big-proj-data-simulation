@@ -12,7 +12,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import __version__
-from .schema import CT_COUNTS, GENERATION_COLUMNS, MANIFEST_COLUMNS, RGB_COUNT, output_stem
+from .schema import (
+    CT_AXIS_COORDINATES,
+    CT_COUNTS,
+    GENERATION_COLUMNS,
+    MANIFEST_COLUMNS,
+    RGB_COUNT,
+    ct_axis_transform,
+    output_stem,
+)
 from .util import atomic_json, config_hash, stable_seed
 
 
@@ -20,6 +28,7 @@ LOGGER = logging.getLogger(__name__)
 GLOBAL_SEED = 20260723
 CT_POROSITY_LIMIT = 0.25
 SELECTED_IDS = 20
+DEFECTIVE_ID_COUNTS = {"CT": 1, "RGB": 2}
 NORMAL_AUGMENTATIONS = {
     "CT": ("brightness_contrast_gamma", "partial_histogram_blend", "normal_noise_poisson", "low_frequency_shading", "percentile_tone_curve", "weak_reconstruction_kernel", "synchronized_flip"),
     "RGB": ("safe_translate_rotate", "brightness_contrast_gamma", "rgb_channel_gain_tone", "low_frequency_lighting", "poisson_noise", "weak_reconstruction"),
@@ -30,19 +39,18 @@ FAILURE_CASES = {
 }
 DEFECT_FLAGS = {"CT": ("has_porosity",), "RGB": ("has_damaged", "has_pollution")}
 
-# 계획서 4.5(v1.4): RGB 는 층 비례가 아니라 목표 구성으로 뽑는다. 원본에서 250 프레임
-# 창은 사실상 전부 결함이거나 전부 무결함이라(창 선택으로 비율 조절이 가능한 ID 는 727 개
-# 중 9 개뿐) 결함률이 5% 단위로만 움직인다. 그래서 결함률과 클래스 구성을 먼저 정하고
-# 그 목표에 가장 가까운 ID·구간 조합을 찾는다.
-RGB_DEFECT_RATE = 0.10
+# 계획서 v1.5 §4.3: RGB는 정확히 두 제품불량 ID를 선택하고, 그 ID의 결함 이미지 안에서
+# 클래스 구성 목표에 가장 가까운 구간 조합을 찾는다.
+# Product status is fixed by ID count.  This objective applies only to the
+# defect-image classes inside the two selected defective RGB IDs.
 RGB_DEFECT_COMPOSITION = {"pollution_only": 0.40, "both": 0.35, "damaged_only": 0.25}
 RGB_SEARCH_POOL = {"damaged_only": 24, "both": 12, "pollution_only": 12}
 RGB_WINDOWS_PER_ID = 8
 # 계획서 7.3 의 FAIL 구간 길이 L.
 FAIL_LENGTH_RANGE = (10, 25)
 
-SEARCH_ALGORITHM = "deterministic-sliding-window-v1.3"
-SEARCH_STOP_CONDITION = "exhaustive over eligible windows of the fixed length"
+SEARCH_ALGORITHM = "deterministic-fixed-id-v1.5"
+SEARCH_STOP_CONDITION = "exhaustive within the recorded bounded ID/profile candidate set"
 
 
 def _rows(cache_path: Path) -> list[dict[str, Any]]:
@@ -290,7 +298,7 @@ def _max_defect_run(item: "Selection", modality: str) -> int:
 
 
 def _frame_kind(row: dict[str, Any]) -> str:
-    """RGB 프레임 하나의 결함 조합. 계획서 4.5(v1.4) 의 3 분류다."""
+    """RGB 프레임 하나의 결함 조합. 계획서 v1.5 §4.3의 3분류다."""
     damaged, pollution = bool(row["has_damaged"]), bool(row["has_pollution"])
     if damaged and pollution:
         return "both"
@@ -331,10 +339,10 @@ def _rgb_window_profiles(items: list[dict[str, Any]]) -> list[tuple[Counter, int
 def _rgb_defect_search(
     grouped: dict[int, list[dict[str, Any]]],
 ) -> tuple[list[tuple[int, int]], dict[str, Any]]:
-    """목표 결함률과 클래스 구성에 가장 가까운 불량 ID·구간 조합을 찾는다.
+    """두 제품불량 ID의 클래스 구성 목표에 가장 가까운 후보 조합을 찾는다.
 
     후보 전체로 조합을 열거하면 500 개 가까운 ID 에 대해 조합 폭발이 일어난다. 구성
-    요소별로 기여가 큰 ID 만 남겨 탐색 대상을 줄이고, 그 안에서 2~3 개 조합을 전수
+    요소별로 기여가 큰 ID 만 남겨 탐색 대상을 줄이고, 그 안에서 2개 ID 조합을 전수
     조사한다. 계획서 4.4 가 요구하는 대로 "절대 최적"이 아니라 "탐색된 후보 중 목적함수
     최소"로 기록한다.
     """
@@ -346,38 +354,33 @@ def _rgb_defect_search(
         pool.extend(ranked[:size])
     pool = list(dict.fromkeys(pool))
 
-    target_frames = round(RGB_DEFECT_RATE * SELECTED_IDS * RGB_COUNT)
-    tolerance = max(1, round(target_frames * 0.25))
     best: tuple[tuple[float, ...], list[tuple[int, int]], Counter] | None = None
     examined = 0
-    for size in (1, 2, 3):
-        for combination in itertools.combinations(pool, size):
-            for picks in itertools.product(*(profiles[bid] for bid in combination)):
-                examined += 1
-                totals: Counter = Counter()
-                for counts, _ in picks:
-                    totals.update(counts)
-                frames = sum(totals.values())
-                if abs(frames - target_frames) > tolerance:
-                    continue
-                deviation = max(
-                    abs(totals[name] / frames - share)
-                    for name, share in RGB_DEFECT_COMPOSITION.items()
-                )
-                key = (
-                    round(deviation, 6),
-                    abs(frames - target_frames) / target_frames,
-                    stable_seed(GLOBAL_SEED, "RGB", *sorted(combination)),
-                )
-                if best is None or key < best[0]:
-                    best = (key, [(bid, start) for bid, (_, start) in zip(combination, picks)], totals)
+    for combination in itertools.combinations(pool, DEFECTIVE_ID_COUNTS["RGB"]):
+        for picks in itertools.product(*(profiles[bid] for bid in combination)):
+            examined += 1
+            totals: Counter = Counter()
+            for counts, _ in picks:
+                totals.update(counts)
+            frames = sum(totals.values())
+            deviation = max(
+                abs(totals[name] / frames - share)
+                for name, share in RGB_DEFECT_COMPOSITION.items()
+            )
+            key = (
+                round(deviation, 6),
+                -frames,
+                stable_seed(GLOBAL_SEED, "RGB", *sorted(combination)),
+            )
+            if best is None or key < best[0]:
+                best = (key, [(bid, start) for bid, (_, start) in zip(combination, picks)], totals)
     if best is None:
         raise ValueError(
-            "RGB: 계획서 4.5(v1.4) 의 목표 결함률과 구성을 만족하는 조합이 없다. 반올림하지 않고 중단한다"
+            "RGB: no two-ID combination can provide the requested defect classes"
         )
     key, chosen, totals = best
     evidence = {
-        "target_frames": target_frames,
+        "target_defective_ids": DEFECTIVE_ID_COUNTS["RGB"],
         "target_composition": RGB_DEFECT_COMPOSITION,
         "achieved_frames": sum(totals.values()),
         "achieved_composition": {name: round(totals[name] / sum(totals.values()), 6) for name in RGB_DEFECT_COMPOSITION},
@@ -411,30 +414,8 @@ def _stratum(rows: list[dict[str, Any]], modality: str) -> str:
     return "clean"
 
 
-def _allocate(counts: dict[str, int], total: int, available: dict[str, int]) -> dict[str, int]:
-    """층별 ID 개수를 최대잉여법으로 비례 배분한다.
-
-    후보가 배분량보다 적은 층은 가진 만큼만 쓰고, 남은 몫은 여유가 있는 층으로 넘긴다.
-    """
-    population = sum(counts.values())
-    exact = {name: counts[name] / population * total for name in counts}
-    result = {name: min(int(value), available[name]) for name, value in exact.items()}
-    while sum(result.values()) < total:
-        candidates = [name for name in counts if result[name] < available[name]]
-        if not candidates:
-            break
-        best = max(candidates, key=lambda name: (exact[name] - result[name], -stable_seed(GLOBAL_SEED, name)))
-        result[best] += 1
-    return result
-
-
 def _select_rgb(grouped: dict[int, list[dict[str, Any]]], population: Stats) -> list[Selection]:
-    """계획서 4.5(v1.4) 의 RGB 선정.
-
-    불량 ID 는 목표 결함률과 3 분류 구성으로 먼저 정하고, 나머지 자리를 무결함 ID 로
-    채운다. RGB 결함은 배터리 단위라 층 비례로는 결함률을 5% 단위로만 움직일 수 있고
-    클래스 구성도 통제할 수 없다.
-    """
+    """Select exactly two defective IDs while preserving class composition."""
     chosen_defective, evidence = _rgb_defect_search(grouped)
     selections: list[Selection] = []
     used: set[int] = set()
@@ -520,31 +501,33 @@ def _select(rows: list[dict[str, Any]], modality: str) -> tuple[list[Selection],
 
     if not candidates:
         raise ValueError(f"{modality}: 적격 ID 가 없다")
-    available = {name: len(items) for name, items in candidates.items()}
-    quota = _allocate(available, SELECTED_IDS, available)
-    if sum(quota.values()) != SELECTED_IDS:
+    normal = list(candidates.get(free, []))
+    defective = [
+        item for stratum, items in candidates.items() if stratum != free for item in items
+    ]
+    sort_key = lambda item: (
+        item.primary_objective,
+        item.secondary_objective,
+        item.count_objective,
+        stable_seed(GLOBAL_SEED, modality, item.battery_id),
+    )
+    normal.sort(key=sort_key)
+    defective.sort(key=sort_key)
+    defective_needed = DEFECTIVE_ID_COUNTS[modality]
+    normal_needed = SELECTED_IDS - defective_needed
+    if len(defective) < defective_needed or len(normal) < normal_needed:
         raise ValueError(
-            f"{modality}: 계획서 4.5 의 층화 배분으로 {SELECTED_IDS} 개를 채울 수 없다. "
-            f"적격 {available}, 배분 {quota}. 반올림하지 않고 중단한다"
+            f"{modality}: fixed ID ratio requires {defective_needed} defective and "
+            f"{normal_needed} normal IDs; eligible counts are "
+            f"{len(defective)} defective and {len(normal)} normal"
         )
-    chosen: list[Selection] = []
-    for stratum, count in sorted(quota.items()):
-        items = sorted(
-            candidates[stratum],
-            key=lambda item: (
-                item.primary_objective,
-                item.secondary_objective,
-                item.count_objective,
-                stable_seed(GLOBAL_SEED, modality, item.battery_id),
-            ),
-        )
-        chosen.extend(items[:count])
+    chosen = defective[:defective_needed] + normal[:normal_needed]
     # 불량 ID 를 먼저 배치해 출력 ID 번호가 제품 상태와 무관하게 흩어지지 않도록 한다.
     chosen.sort(key=lambda item: (item.product_status != "defective", item.stratum, item.battery_id))
     LOGGER.info(
-        "%s stratified selection: %s (defective %d/%d)",
+        "%s fixed-status selection: %s (defective %d/%d)",
         modality,
-        {name: quota[name] for name in sorted(quota) if quota[name]},
+        Counter(item.stratum for item in chosen),
         sum(1 for item in chosen if item.product_status == "defective"),
         len(chosen),
     )
@@ -616,7 +599,7 @@ def _candidate_record(rank: int, reason: str, row: dict[str, Any]) -> dict[str, 
 
 
 def _sequence_metadata(
-    window: list[dict[str, Any]], modality: str, reverse: bool
+    window: list[dict[str, Any]], modality: str, reversed_axes: set[str]
 ) -> dict[int, dict[str, int]]:
     """축 단위 순서와 index 누락을 계산한다.
 
@@ -628,7 +611,7 @@ def _sequence_metadata(
     for position, row in enumerate(window):
         by_axis[row["axis"] if modality == "CT" else ""].append(position)
     metadata: dict[int, dict[str, int]] = {}
-    for positions in by_axis.values():
+    for axis, positions in by_axis.items():
         ordered = sorted(positions, key=lambda position: window[position]["original_index"])
         for order, position in enumerate(ordered):
             previous = window[ordered[order - 1]]["original_index"] if order else None
@@ -636,7 +619,9 @@ def _sequence_metadata(
             gap = 0 if previous is None else max(0, current - previous - 1)
             metadata[position] = {
                 "source_sequence_order": order,
-                "output_sequence_order": len(ordered) - 1 - order if reverse else order,
+                "output_sequence_order": (
+                    len(ordered) - 1 - order if axis in reversed_axes else order
+                ),
                 "index_gap_before": int(bool(gap)),
                 "index_gap_size": gap,
             }
@@ -646,17 +631,18 @@ def _sequence_metadata(
 def _configuration(seed: int) -> dict[str, Any]:
     """결과를 바꾸는 설정 전체. 계획서 13.3 의 config_hash 재료다.
 
-    여기에 빠진 상수는 값이 바뀌어도 해시가 그대로다. v1.4 의 목표 결함률과 클래스 구성,
-    층 경계, FAIL 구간 길이가 빠져 있어 v1.3 과 v1.4 의 해시가 같게 나왔다.
+    ID 개수, 클래스 구성, CT 좌표계와 FAIL 구간 등 출력 의미를 바꾸는 값은 모두 해시에
+    포함되어야 한다.
     """
     return {
         "global_seed": seed,
         "ct_counts": CT_COUNTS,
+        "ct_axis_coordinates": CT_AXIS_COORDINATES,
         "rgb_count": RGB_COUNT,
         "selected_ids": SELECTED_IDS,
         "ct_porosity_limit": CT_POROSITY_LIMIT,
         "ct_positive_rate_bins": [[name, low, high] for name, low, high in CT_POSITIVE_RATE_BINS],
-        "rgb_defect_rate": RGB_DEFECT_RATE,
+        "defective_id_counts": DEFECTIVE_ID_COUNTS,
         "rgb_defect_composition": RGB_DEFECT_COMPOSITION,
         "rgb_search_pool": RGB_SEARCH_POOL,
         "rgb_windows_per_id": RGB_WINDOWS_PER_ID,
@@ -687,7 +673,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
         base = 1_900_000_000 if modality == "CT" else 2_900_000_000
         chosen = selections[modality]
         population = populations[modality]
-        # 계획서 7.1(v1.4): FAIL 대상 2 개를 제품 상태별로 하나씩 고른다. 두 개를 한
+        # 계획서 v1.5 §7: FAIL 대상 2개를 제품 상태별로 하나씩 고른다. 두 개를 한
         # 무더기에서 뽑으면 촬영실패와 제품불량이 겹치는 칸이 비어 버린다. v1.3 산출물이
         # 실제로 그랬다.
         fail_ids: set[int] = set()
@@ -716,7 +702,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
             if modality == "CT":
                 axes = list(CT_COUNTS)
                 if defective_target:
-                    # 계획서 7.2(v1.4): 불량 ID 의 FAIL 구간은 결함이 있는 축에서 고른다.
+                    # 계획서 v1.5 §7: 불량 ID의 FAIL 구간은 결함이 있는 축에서 고른다.
                     with_defect = [
                         candidate for candidate in axes
                         if any(defect_at[index] for index, row in enumerate(item.window) if row["axis"] == candidate)
@@ -758,8 +744,13 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
             probe_seed = stable_seed(seed, modality, item.battery_id, "normal-base")
             probe_names, _ = _normal_assignment(modality, augmentation_slot, probe_seed)
             # 계획서 6.2: 슬라이스 순서 역전 여부는 ID 단위로 한 번만 결정한다.
-            reverse = modality == "CT" and "synchronized_flip" in probe_names and bool(probe_seed & 4)
-            sequence = _sequence_metadata(item.window, modality, reverse)
+            reversed_axes = {
+                axis for axis in CT_COUNTS
+                if modality == "CT"
+                and "synchronized_flip" in probe_names
+                and ct_axis_transform(probe_seed, axis).reverse_slices
+            }
+            sequence = _sequence_metadata(item.window, modality, reversed_axes)
             layout = fail_layout.get(item.battery_id)
             selected_records.append({
                 "modality": modality,
@@ -774,7 +765,9 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 "search_seed": seed,
                 "search_iterations": max(1, len(item.window)),
                 "search_stop_condition": SEARCH_STOP_CONDITION,
-                "target_frames": item.evidence.get("target_frames", ""),
+                "target_defective_ids": item.evidence.get(
+                    "target_defective_ids", DEFECTIVE_ID_COUNTS[modality]
+                ),
                 "target_composition": json.dumps(item.evidence.get("target_composition", {}), sort_keys=True) if item.evidence else "",
                 "achieved_composition": json.dumps(item.evidence.get("achieved_composition", {}), sort_keys=True) if item.evidence else "",
                 "max_deviation_pp": item.evidence.get("max_deviation_pp", ""),
@@ -784,7 +777,10 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                 "annotation_count_objective": round(item.count_objective, 8),
                 "population_defect_image_ratio": round(population.defect_image_ratio, 8),
                 "population_mean_defect_count": round(population.mean_defect_count, 8),
-                "slice_order_reversed": reverse,
+                "slice_order_reversed": bool(reversed_axes),
+                "slice_order_reversed_by_axis": json.dumps(
+                    {axis: axis in reversed_axes for axis in CT_COUNTS}, sort_keys=True
+                ) if modality == "CT" else False,
                 "rejection_reason": item.rejection,
             })
 

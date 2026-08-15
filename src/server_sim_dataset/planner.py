@@ -26,9 +26,17 @@ from .util import atomic_json, config_hash, stable_seed
 LOGGER = logging.getLogger(__name__)
 GLOBAL_SEED = 20260723
 CT_POROSITY_LIMIT = 0.25
-SELECTED_IDS = 100
-DEFECTIVE_ID_COUNTS = {"CT": 5, "RGB": 10}
-FAILURE_ID_COUNTS = {"CT": 10, "RGB": 10}
+SELECTED_IDS = 40
+DEFECTIVE_ID_COUNTS = {"CT": 2, "RGB": 4}
+FAILURE_ID_COUNTS = {"CT": 4, "RGB": 4}
+INITIAL_QUANTITIES = {"CT": SELECTED_IDS * sum(CT_COUNTS.values()), "RGB": SELECTED_IDS * RGB_COUNT}
+RECAPTURE_QUANTITIES = {
+    "CT": FAILURE_ID_COUNTS["CT"] * sum(CT_COUNTS.values()),
+    "RGB": FAILURE_ID_COUNTS["RGB"] * RGB_COUNT,
+}
+INITIAL_TOTAL = sum(INITIAL_QUANTITIES.values())
+RECAPTURE_TOTAL = sum(RECAPTURE_QUANTITIES.values())
+PLAN_TOTAL = INITIAL_TOTAL + RECAPTURE_TOTAL
 NORMAL_AUGMENTATIONS = {
     "CT": ("brightness_contrast_gamma", "partial_histogram_blend", "normal_noise_poisson", "low_frequency_shading", "percentile_tone_curve", "weak_reconstruction_kernel", "synchronized_flip"),
     "RGB": ("safe_translate_rotate", "brightness_contrast_gamma", "rgb_channel_gain_tone", "low_frequency_lighting", "poisson_noise", "weak_reconstruction"),
@@ -771,9 +779,8 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
         chosen = selections[modality]
         population = populations[modality]
         source_reuse_totals = Counter(item.battery_id for item in chosen)
-        # 계획서 v1.5 §7: FAIL 대상 2개를 제품 상태별로 하나씩 고른다. 두 개를 한
-        # 무더기에서 뽑으면 촬영실패와 제품불량이 겹치는 칸이 비어 버린다. v1.3 산출물이
-        # 실제로 그랬다.
+        # FAIL 대상은 모달리티별 4개이며 제품불량 2개와 정상 2개로 균등 배분한다.
+        # 이 배분으로 제품 상태(정상/불량) × 촬영 품질(PASS/FAIL)의 모든 조합을 유지한다.
         fail_ids: set[tuple[int, int]] = set()
         per_status_failures = FAILURE_ID_COUNTS[modality] // 2
         for status in ("defective", "normal"):
@@ -1003,7 +1010,7 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
                     })
                     plan_records.append(retry)
 
-    expected = {"initial_capture": 170000, "recapture": 17000}
+    expected = {"initial_capture": INITIAL_TOTAL, "recapture": RECAPTURE_TOTAL}
     actual = {name: sum(row["capture_set"] == name for row in plan_records) for name in expected}
     if actual != expected:
         raise AssertionError(f"Plan quantity mismatch: {actual} != {expected}")
@@ -1028,9 +1035,9 @@ def build_plan(cache_path: Path, output_dir: Path, seed: int = GLOBAL_SEED) -> d
         writer.writerows(selected_records)
 
     summary = {
-        "initial_capture": 170000,
-        "recapture": 17000,
-        "total": 187000,
+        "initial_capture": INITIAL_TOTAL,
+        "recapture": RECAPTURE_TOTAL,
+        "total": PLAN_TOTAL,
         "CT_selected_ids": SELECTED_IDS,
         "RGB_selected_ids": SELECTED_IDS,
         "seed": seed,

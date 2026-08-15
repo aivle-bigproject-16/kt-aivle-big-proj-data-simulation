@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .cache import ensure_cache, export_cache_csv
 from .generator import generate, package_outputs, verify
-from .planner import build_plan
+from .planner import PLAN_TOTAL, build_plan
 from .smoke import run_smoke_test
 
 
@@ -18,7 +18,7 @@ def parser() -> argparse.ArgumentParser:
     commands=root.add_subparsers(dest="command",required=True)
     scan=commands.add_parser("scan",help="scan extracted JSON and build reusable SQLite cache")
     scan.add_argument("--raw-root",type=Path,required=True); scan.add_argument("--cache",type=Path,required=True); scan.add_argument("--refresh-cache",action="store_true"); scan.add_argument("--export-csv",type=Path)
-    plan=commands.add_parser("plan",help="create deterministic 187,000-row generation plan")
+    plan=commands.add_parser("plan",help=f"create deterministic {PLAN_TOTAL:,}-row generation plan")
     plan.add_argument("--raw-root",type=Path,required=True); plan.add_argument("--cache",type=Path,required=True); plan.add_argument("--output",type=Path,required=True); plan.add_argument("--refresh-cache",action="store_true")
     gen=commands.add_parser("generate",help="generate images, JSON, YOLO labels and manifest")
     gen.add_argument("--raw-root",type=Path,required=True); gen.add_argument("--plan",type=Path,required=True); gen.add_argument("--output",type=Path,required=True); gen.add_argument("--engine-root",type=Path); gen.add_argument("--limit",type=int); gen.add_argument("--resume",action="store_true")
@@ -35,7 +35,7 @@ def parser() -> argparse.ArgumentParser:
     smoke.add_argument("--plan-dir",type=Path,required=True); smoke.add_argument("--output",type=Path,required=True)
     smoke.add_argument("--engine-root",type=Path,required=True); smoke.add_argument("--per-group",type=int,default=2)
     smoke.add_argument("--refresh-cache",action="store_true")
-    smoke.add_argument("--full-scan",action="store_true",help="also build/reuse the complete cache and 187,000-row plan")
+    smoke.add_argument("--full-scan",action="store_true",help=f"also build/reuse the complete cache and {PLAN_TOTAL:,}-row plan")
     return root
 
 

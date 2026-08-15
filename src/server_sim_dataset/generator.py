@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, JpegImagePlugin
 
 from . import __version__
-from .planner import FAILURE_CASES
+from .planner import FAILURE_CASES, INITIAL_QUANTITIES, RECAPTURE_QUANTITIES
 from .schema import (
     MANIFEST_COLUMNS,
     ct_axis_transform,
@@ -781,8 +781,8 @@ def generate(
 
 
 EXPECTED_QUANTITIES = {
-    ("initial_capture", "CT"): 145000, ("initial_capture", "RGB"): 25000,
-    ("recapture", "CT"): 14500, ("recapture", "RGB"): 2500,
+    **{("initial_capture", modality): count for modality, count in INITIAL_QUANTITIES.items()},
+    **{("recapture", modality): count for modality, count in RECAPTURE_QUANTITIES.items()},
 }
 
 

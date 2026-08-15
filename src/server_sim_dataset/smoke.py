@@ -249,7 +249,7 @@ def run_smoke_test(
             full_plan = plan_dir / "generation_plan.csv"
             plan_reused = full_plan.is_file()
             if not plan_reused:
-                LOGGER.info("[smoke 2/7] Building the complete 100-ID generation plan")
+                LOGGER.info("[smoke 2/7] Building the complete 40-ID generation plan")
                 build_plan(cache_path, plan_dir)
             else:
                 LOGGER.info("[smoke 2/7] Reusing generation plan: %s", full_plan)

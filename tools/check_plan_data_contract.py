@@ -26,8 +26,6 @@ REQUIRED_TEXT = {
     "normal_pool": "normal_pair_pool",
     "deterministic_normal": "실행할 때마다 새로 무작위 추첨하지",
     "slice_seed": "slice_seed=stable_seed(id_seed, axis, original_index, augmentation_name)",
-    "ct_output_ids": "1900000001~1900000100",
-    "rgb_output_ids": "2900000001~2900000100",
 }
 
 
@@ -45,10 +43,18 @@ def main() -> int:
             "raw_plan_feasible": audit.get("plan_feasible") is True,
             "raw_schema_errors_zero": audit.get("schema_error_count") == 0,
             "raw_hash_conflicts_zero": audit.get("duplicate_conflict_rows_excluded") == 0,
-            "ct_normal_candidates": audit.get("CT", {}).get("normal_candidate_count", 0) >= 19,
+            "ct_normal_candidates": audit.get("CT", {}).get("normal_candidate_count", 0) >= 1,
             "ct_defective_candidates": audit.get("CT", {}).get("defective_candidate_count", 0) >= 1,
-            "rgb_normal_candidates": audit.get("RGB", {}).get("normal_candidate_count", 0) >= 19,
+            "rgb_normal_candidates": audit.get("RGB", {}).get("normal_candidate_count", 0) >= 1,
             "rgb_defective_candidates": audit.get("RGB", {}).get("defective_candidate_count", 0) >= 1,
+            "ct_output_contract": (
+                audit.get("CT", {}).get("required_normal_output_ids") == 38
+                and audit.get("CT", {}).get("required_defective_output_ids") == 2
+            ),
+            "rgb_output_contract": (
+                audit.get("RGB", {}).get("required_normal_output_ids") == 36
+                and audit.get("RGB", {}).get("required_defective_output_ids") == 4
+            ),
             "output_ids_disjoint": audit.get("output_id_ranges_disjoint") is True,
         }
     )

@@ -64,7 +64,7 @@ $raw = "C:\Users\<user>\...\103.배터리 불량 이미지 데이터"
 - 캐시 스키마는 v2다. v1 캐시는 `original_image_id`와 원본 ROI 값을 갖고 있지 않으므로
   재사용되지 않고 자동으로 다시 만들어진다.
 
-## 2. 37,400장 generation plan 생성
+## 2. 187,000장 generation plan 생성
 
 ```powershell
 & $py -X utf8 -m server_sim_dataset.cli plan `
@@ -73,7 +73,9 @@ $raw = "C:\Users\<user>\...\103.배터리 불량 이미지 데이터"
   --output ".\work\plan"
 ```
 
-계획은 1차 CT 29,000장, RGB 5,000장과 재촬영 CT 2,900장, RGB 500장으로 구성된다.
+계획은 CT/RGB 각각 100개 출력 ID를 만든다. ID당 이미지 수는 기존과 같아 1차 CT
+145,000장, RGB 25,000장과 재촬영 CT 14,500장, RGB 2,500장으로 구성된다. 제품불량
+비율은 CT 5%, RGB 10%, 촬영 FAIL 대상 ID 비율은 각 모달리티 10%로 v1.5와 같다.
 generation plan과 dataset manifest는 같은 72개 컬럼 스키마를 쓴다. 생성 단계에서만
 정해지는 컬럼은 plan에 빈 문자열로 들어간다.
 

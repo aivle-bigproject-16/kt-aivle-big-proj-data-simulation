@@ -741,8 +741,8 @@ def generate(
 
 
 EXPECTED_QUANTITIES = {
-    ("initial_capture", "CT"): 29000, ("initial_capture", "RGB"): 5000,
-    ("recapture", "CT"): 2900, ("recapture", "RGB"): 500,
+    ("initial_capture", "CT"): 145000, ("initial_capture", "RGB"): 25000,
+    ("recapture", "CT"): 14500, ("recapture", "RGB"): 2500,
 }
 
 

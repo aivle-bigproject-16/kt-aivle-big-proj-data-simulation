@@ -26,8 +26,8 @@ REQUIRED_TEXT = {
     "normal_pool": "normal_pair_pool",
     "deterministic_normal": "실행할 때마다 새로 무작위 추첨하지",
     "slice_seed": "slice_seed=stable_seed(id_seed, axis, original_index, augmentation_name)",
-    "ct_output_ids": "1900000001~1900000020",
-    "rgb_output_ids": "2900000001~2900000020",
+    "ct_output_ids": "1900000001~1900000100",
+    "rgb_output_ids": "2900000001~2900000100",
 }
 
 

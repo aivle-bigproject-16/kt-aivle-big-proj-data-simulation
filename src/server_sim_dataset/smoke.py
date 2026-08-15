@@ -111,14 +111,20 @@ def write_quick_smoke_plan(raw_root: Path, smoke_plan: Path, per_group: int) -> 
             ("recapture", "PASS"),
         )):
             for position in range(per_group):
-                # Initial PASS uses the normal source. Initial FAIL and its recapture
-                # use the same defective source, but live in different capture folders.
-                source_index = 0 if route_index == 0 else min(1, len(sources) - 1)
+                # Quick smoke isolates capture-quality execution from product-defect
+                # sensitivity. The full-plan smoke covers the product-status cross
+                # product and reserve selection. Some defective RGB frames cannot
+                # satisfy the underexposure spatial-order gate for any fixed seed.
+                source_index = 0
                 json_path, payload = sources[source_index]
                 image_path = images[json_path.stem]
                 parsed = parse_stem(json_path.stem)
                 counter += 1
                 seed = stable_seed("quick-smoke", modality, capture_set, quality, position)
+                # PASS is one capture group; FAIL and its recapture share another.
+                # This prevents initial PASS/FAIL from writing the same output stem
+                # when quick smoke deliberately uses one stable source image.
+                output_id_slot = 0 if route_index == 0 else 1
                 rows.append({
                     "sample_id": f"Q{counter:05d}",
                     "capture_group_id": f"QG{modality}{position:03d}",
@@ -126,7 +132,10 @@ def write_quick_smoke_plan(raw_root: Path, smoke_plan: Path, per_group: int) -> 
                     "capture_set": capture_set,
                     "modality": modality,
                     "original_battery_id": parsed.battery_id,
-                    "output_battery_id": (1_900_000_001 if modality == "CT" else 2_900_000_001) + position,
+                    "output_battery_id": (
+                        (1_900_000_001 if modality == "CT" else 2_900_000_001)
+                        + output_id_slot * per_group + position
+                    ),
                     "product_status": "defective" if any(True for _ in iter_defects(payload)) else "normal",
                     "axis": parsed.axis,
                     "original_index": parsed.original_index,

@@ -10,10 +10,10 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 $RawRoot = [IO.Path]::GetFullPath($RawRoot)
-if (-not [IO.Path]::IsPathFullyQualified($EngineRoot)) {
+if (-not [IO.Path]::IsPathRooted($EngineRoot)) {
     $EngineRoot = Join-Path $RepoRoot $EngineRoot
 }
-if (-not [IO.Path]::IsPathFullyQualified($Output)) {
+if (-not [IO.Path]::IsPathRooted($Output)) {
     $Output = Join-Path $RepoRoot $Output
 }
 $EngineRoot = [IO.Path]::GetFullPath($EngineRoot)

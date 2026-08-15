@@ -21,6 +21,7 @@ LOGGER = logging.getLogger(__name__)
 
 def _quick_json_candidates(raw_root: Path) -> dict[str, list[tuple[Path, dict[str, Any]]]]:
     """Read only enough extracted JSON files to cover CT/RGB normal and defective routes."""
+    LOGGER.info("[smoke 1/7] Searching extracted label JSON under %s", raw_root)
     selected: dict[str, list[tuple[Path, dict[str, Any]]]] = {"CT": [], "RGB": []}
     states: dict[str, set[bool]] = {"CT": set(), "RGB": set()}
     label_roots = [
@@ -28,11 +29,16 @@ def _quick_json_candidates(raw_root: Path) -> dict[str, list[tuple[Path, dict[st
     ]
     if not label_roots:
         raise FileNotFoundError("No extracted 02.라벨링데이터 directory found under raw root")
+    LOGGER.info("[smoke 1/7] Found %d label roots", len(label_roots))
+    scanned = 0
     for label_root in sorted(label_roots):
         for directory, _, filenames in os.walk(label_root):
             for filename in filenames:
                 if not filename.lower().endswith(".json"):
                     continue
+                scanned += 1
+                if scanned % 5000 == 0:
+                    LOGGER.info("[smoke 1/7] Scanned %s label JSON files", f"{scanned:,}")
                 path = Path(directory, filename)
                 try:
                     parsed = parse_stem(path.stem)
@@ -46,26 +52,46 @@ def _quick_json_candidates(raw_root: Path) -> dict[str, list[tuple[Path, dict[st
                 if defective not in states[parsed.modality]:
                     selected[parsed.modality].append((path, payload))
                     states[parsed.modality].add(defective)
+                    LOGGER.info(
+                        "[smoke 1/7] Selected %s %s label: %s",
+                        parsed.modality, "defective" if defective else "normal", path.name,
+                    )
                 if all(len(states[modality]) == 2 for modality in ("CT", "RGB")):
+                    LOGGER.info("[smoke 1/7] Label candidate search complete after %s files", f"{scanned:,}")
                     return selected
     missing = [modality for modality in ("CT", "RGB") if len(states[modality]) < 2]
+    LOGGER.error("[smoke 1/7] Candidate search ended after %s JSON files; missing=%s", f"{scanned:,}", missing)
     raise ValueError(f"Quick smoke could not find both normal and defective JSON for: {missing}")
 
 
 def _find_images(raw_root: Path, stems: set[str]) -> dict[str, Path]:
+    LOGGER.info("[smoke 2/7] Matching %d source images", len(stems))
     found: dict[str, Path] = {}
+    scanned = 0
     for split in ("Training", "Validation"):
         source_root = raw_root / "3.개방데이터" / "1.데이터" / split / "01.원천데이터"
         if not source_root.is_dir():
             continue
         for directory, _, filenames in os.walk(source_root):
             for filename in filenames:
+                scanned += 1
+                if scanned % 10000 == 0:
+                    LOGGER.info(
+                        "[smoke 2/7] Scanned %s source files; matched %d/%d",
+                        f"{scanned:,}", len(found), len(stems),
+                    )
                 path = Path(directory, filename)
                 if path.stem in stems and path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
                     found.setdefault(path.stem, path)
+                    LOGGER.info("[smoke 2/7] Matched source image: %s", path.name)
             if stems <= found.keys():
+                LOGGER.info("[smoke 2/7] Source image matching complete")
                 return found
     missing = sorted(stems - found.keys())
+    LOGGER.error(
+        "[smoke 2/7] Image search ended after %s files; matched %d/%d; missing=%s",
+        f"{scanned:,}", len(found), len(stems), missing,
+    )
     raise FileNotFoundError(f"Quick smoke paired images not found: {missing}")
 
 
@@ -73,6 +99,7 @@ def write_quick_smoke_plan(raw_root: Path, smoke_plan: Path, per_group: int) -> 
     candidates = _quick_json_candidates(raw_root)
     stems = {path.stem for values in candidates.values() for path, _ in values}
     images = _find_images(raw_root, stems)
+    LOGGER.info("[smoke 3/7] Building quick plan with per-group=%d", per_group)
     rows: list[dict[str, Any]] = []
     counter = 0
     cases = {"CT": "ct_low_signal_noise", "RGB": "rgb_underexposure"}
@@ -124,6 +151,7 @@ def write_quick_smoke_plan(raw_root: Path, smoke_plan: Path, per_group: int) -> 
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    LOGGER.info("[smoke 3/7] Quick plan written: %s (%d rows)", smoke_plan, len(rows))
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
         counts[f"{row['modality']}_{row['capture_set']}_{row['capture_quality']}"] += 1
@@ -165,8 +193,14 @@ def select_smoke_rows(rows: list[dict[str, str]], per_group: int) -> list[dict[s
 
 
 def write_smoke_plan(source_plan: Path, smoke_plan: Path, per_group: int) -> dict[str, int]:
+    LOGGER.info("[smoke 3/7] Reading full generation plan: %s", source_plan)
+    rows = []
     with source_plan.open("r", encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+        for index, row in enumerate(csv.DictReader(handle), 1):
+            rows.append(row)
+            if index % 25000 == 0:
+                LOGGER.info("[smoke 3/7] Read %s plan rows", f"{index:,}")
+    LOGGER.info("[smoke 3/7] Full plan loaded: %s rows", f"{len(rows):,}")
     selected = select_smoke_rows(rows, per_group)
     smoke_plan.parent.mkdir(parents=True, exist_ok=True)
     with smoke_plan.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -177,6 +211,7 @@ def write_smoke_plan(source_plan: Path, smoke_plan: Path, per_group: int) -> dic
     for row in selected:
         counts[f"{row['modality']}_{row['capture_set']}_{row['capture_quality']}"] += 1
     counts["total"] = len(selected)
+    LOGGER.info("[smoke 3/7] Stratified smoke plan written: %s (%d rows)", smoke_plan, len(selected))
     return dict(counts)
 
 
@@ -194,16 +229,21 @@ def run_smoke_test(
     started = time.perf_counter()
     summary_path = output / "smoke_test_summary.json"
     try:
+        LOGGER.info("Smoke test started | mode=%s | raw=%s | output=%s", "full" if full_scan else "quick", raw_root, output)
         if output.exists() and any(output.iterdir()):
             raise ValueError(f"Smoke output directory is not empty: {output}")
         output.mkdir(parents=True, exist_ok=True)
         smoke_plan = output / "smoke_generation_plan.csv"
         if full_scan:
+            LOGGER.info("[smoke 1/7] Building or reusing the complete raw cache")
             _, cache_reused = ensure_cache(raw_root, cache_path, refresh_cache)
             full_plan = plan_dir / "generation_plan.csv"
             plan_reused = full_plan.is_file()
             if not plan_reused:
+                LOGGER.info("[smoke 2/7] Building the complete 100-ID generation plan")
                 build_plan(cache_path, plan_dir)
+            else:
+                LOGGER.info("[smoke 2/7] Reusing generation plan: %s", full_plan)
             route_counts = write_smoke_plan(full_plan, smoke_plan, per_group)
             mode = "full-plan"
         else:
@@ -212,8 +252,12 @@ def run_smoke_test(
             route_counts = write_quick_smoke_plan(raw_root, smoke_plan, per_group)
             mode = "quick-no-full-scan"
         LOGGER.info("Smoke plan ready: %d samples across six required routes", route_counts["total"])
+        LOGGER.info("[smoke 4/7] Loading failure engine and generating smoke artifacts")
         generation = generate(raw_root, smoke_plan, output / "dataset", engine_root)
+        LOGGER.info("[smoke 4/7] Generation complete: %s", generation)
+        LOGGER.info("[smoke 5/7] Verifying files, hashes, JSON and labels")
         verification = verify(output / "dataset")
+        LOGGER.info("[smoke 5/7] Verification complete: %s", verification)
         result: dict[str, Any] = {
             "status": "passed",
             "mode": mode,
@@ -227,7 +271,8 @@ def run_smoke_test(
             "output": str(output.resolve()),
         }
         atomic_json(summary_path, result)
-        LOGGER.info("Smoke test PASSED: %s", summary_path)
+        LOGGER.info("[smoke 6/7] Summary written: %s", summary_path)
+        LOGGER.info("[smoke 7/7] Smoke test PASSED")
         return result
     except Exception as exc:
         output.mkdir(parents=True, exist_ok=True)

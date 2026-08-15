@@ -40,16 +40,17 @@ class StubEngine:
 
     __name__ = "stub_engine"
 
-    def __init__(self, fail_first: int = 0, scale: float = 1.0) -> None:
+    def __init__(self, fail_first: int = 0, scale: float = 1.0, reject_cases: set[str] | None = None) -> None:
         self.fail_first = fail_first
         self.scale = scale
+        self.reject_cases = reject_cases or set()
         self.calls = 0
         self.seeds: list[int] = []
 
     def apply_failure_case(self, image, modality, failure_case, seed, object_mask, defect_mask=None):
         self.calls += 1
         self.seeds.append(seed)
-        if self.calls <= self.fail_first:
+        if self.calls <= self.fail_first or failure_case in self.reject_cases:
             raise ValueError("quality gate rejected the attempt")
         size = (max(2, int(image.width * self.scale)), max(2, int(image.height * self.scale)))
         # 실제 엔진처럼 픽셀을 바꾼다. 그대로 돌려주면 정상 증강 결과와 구분되지 않는다.
@@ -169,6 +170,13 @@ class FailurePathTests(unittest.TestCase):
         engine = StubEngine(fail_first=100)
         with self.assertRaisesRegex(RuntimeError, "exhausted every reserve"):
             self._run(engine, with_reserve=True)
+
+    def test_exhausted_case_falls_back_deterministically(self) -> None:
+        engine = StubEngine(reject_cases={"ct_low_signal_noise"})
+        _, manifest = self._run(engine, with_reserve=True)
+        self.assertNotEqual(manifest[0]["failure_case"], "ct_low_signal_noise")
+        self.assertTrue(manifest[0]["exclusion_or_retry_reason"].startswith("failure_case_fallback:"))
+        self.assertEqual(manifest[0]["quality_gate_passed"], "true")
 
     def test_json_size_follows_the_engine_output(self) -> None:
         """B-03, 계획서 8.1: width/height 가 실제 이미지와 다르면 검증 실패다."""

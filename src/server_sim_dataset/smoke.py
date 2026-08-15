@@ -19,6 +19,12 @@ from .util import atomic_json, safe_relative, sha256_file, stable_seed
 LOGGER = logging.getLogger(__name__)
 
 
+def _is_defective(payload: dict[str, Any], modality: str) -> bool:
+    recognized = {name.lower() for name, _ in iter_defects(payload)}
+    allowed = {"porosity"} if modality == "CT" else {"damaged", "pollution"}
+    return bool(recognized & allowed)
+
+
 def _quick_json_candidates(raw_root: Path) -> dict[str, list[tuple[Path, dict[str, Any]]]]:
     """Read only enough extracted JSON files to cover CT/RGB normal and defective routes."""
     LOGGER.info("[smoke 1/7] Searching extracted label JSON under %s", raw_root)
@@ -43,10 +49,7 @@ def _quick_json_candidates(raw_root: Path) -> dict[str, list[tuple[Path, dict[st
                 try:
                     parsed = parse_stem(path.stem)
                     payload = json.loads(path.read_text(encoding="utf-8-sig"))
-                    recognized = {
-                        name.lower() for name, _ in iter_defects(payload)
-                    } & ({"porosity"} if parsed.modality == "CT" else {"damaged", "pollution"})
-                    defective = bool(recognized)
+                    defective = _is_defective(payload, parsed.modality)
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     continue
                 if defective not in states[parsed.modality]:
@@ -96,6 +99,8 @@ def _find_images(raw_root: Path, stems: set[str]) -> dict[str, Path]:
 
 
 def write_quick_smoke_plan(raw_root: Path, smoke_plan: Path, per_group: int) -> dict[str, int]:
+    if per_group < 1:
+        raise ValueError("per_group must be at least 1")
     candidates = _quick_json_candidates(raw_root)
     stems = {path.stem for values in candidates.values() for path, _ in values}
     images = _find_images(raw_root, stems)
@@ -105,56 +110,60 @@ def write_quick_smoke_plan(raw_root: Path, smoke_plan: Path, per_group: int) -> 
     cases = {"CT": "ct_low_signal_noise", "RGB": "rgb_underexposure"}
     for modality in ("CT", "RGB"):
         sources = candidates[modality]
-        for route_index, (capture_set, quality) in enumerate((
-            ("initial_capture", "PASS"),
-            ("initial_capture", "FAIL"),
-            ("recapture", "PASS"),
-        )):
-            for position in range(per_group):
-                # Quick smoke isolates capture-quality execution from product-defect
-                # sensitivity. The full-plan smoke covers the product-status cross
-                # product and reserve selection. Some defective RGB frames cannot
-                # satisfy the underexposure spatial-order gate for any fixed seed.
-                source_index = 0
-                json_path, payload = sources[source_index]
-                image_path = images[json_path.stem]
-                parsed = parse_stem(json_path.stem)
-                counter += 1
-                seed = stable_seed("quick-smoke", modality, capture_set, quality, position)
-                # PASS is one capture group; FAIL and its recapture share another.
-                # This prevents initial PASS/FAIL from writing the same output stem
-                # when quick smoke deliberately uses one stable source image.
-                output_id_slot = 0 if route_index == 0 else 1
-                rows.append({
-                    "sample_id": f"Q{counter:05d}",
-                    "capture_group_id": f"QG{modality}{position:03d}",
-                    "retry_of_sample_id": "" if capture_set == "initial_capture" else f"quick-{modality}-{position}",
-                    "capture_set": capture_set,
-                    "modality": modality,
-                    "original_battery_id": parsed.battery_id,
-                    "output_battery_id": (
-                        (1_900_000_001 if modality == "CT" else 2_900_000_001)
-                        + output_id_slot * per_group + position
-                    ),
-                    "product_status": "defective" if any(True for _ in iter_defects(payload)) else "normal",
-                    "axis": parsed.axis,
-                    "original_index": parsed.original_index,
-                    "source_split": "training" if "Training" in json_path.parts else "validation",
-                    "original_stem": json_path.stem,
-                    "orig_image_relative_path": safe_relative(raw_root, image_path),
-                    "orig_json_relative_path": safe_relative(raw_root, json_path),
-                    "source_image_sha256": sha256_file(image_path),
-                    "source_json_sha256": sha256_file(json_path),
-                    "capture_quality": quality,
-                    "failure_case": cases[modality] if quality == "FAIL" else "",
-                    "failure_segment_id": f"quick-{modality}" if quality == "FAIL" else "",
-                    "base_augmentation_names": json.dumps(["brightness_contrast_gamma"]),
-                    "normal_augmentation_parameters": json.dumps({"brightness": 1.02, "contrast": 1.01, "gamma": 0.99, "noise_sigma": 0.003}),
-                    "normal_augmentation_seed": seed,
-                    "slice_seed": stable_seed(seed, parsed.axis, parsed.original_index),
-                    "item_seed": stable_seed(seed, "failure"),
-                    "global_seed": 20260723,
-                })
+        by_status = {
+            "defective" if _is_defective(payload, modality) else "normal": (path, payload)
+            for path, payload in sources
+        }
+        fail_sample_ids: dict[tuple[str, int], str] = {}
+        for status_index, product_status in enumerate(("normal", "defective")):
+            json_path, payload = by_status[product_status]
+            for route_index, (capture_set, quality) in enumerate((
+                ("initial_capture", "PASS"),
+                ("initial_capture", "FAIL"),
+                ("recapture", "PASS"),
+            )):
+                for position in range(per_group):
+                    image_path = images[json_path.stem]
+                    parsed = parse_stem(json_path.stem)
+                    counter += 1
+                    sample_id = f"Q{counter:05d}"
+                    if capture_set == "initial_capture" and quality == "FAIL":
+                        fail_sample_ids[(product_status, position)] = sample_id
+                    seed = stable_seed(
+                        "quick-smoke", modality, product_status, capture_set, quality, position
+                    )
+                    # FAIL and its recapture share an output ID; initial PASS uses another.
+                    output_id_slot = status_index * 2 + (0 if route_index == 0 else 1)
+                    rows.append({
+                        "sample_id": sample_id,
+                        "capture_group_id": f"QG{modality}{product_status}{output_id_slot}{position:03d}",
+                        "retry_of_sample_id": "" if capture_set == "initial_capture" else fail_sample_ids[(product_status, position)],
+                        "capture_set": capture_set,
+                        "modality": modality,
+                        "original_battery_id": parsed.battery_id,
+                        "output_battery_id": (
+                            (1_900_000_001 if modality == "CT" else 2_900_000_001)
+                            + output_id_slot * per_group + position
+                        ),
+                        "product_status": product_status,
+                        "axis": parsed.axis,
+                        "original_index": parsed.original_index,
+                        "source_split": "training" if "Training" in json_path.parts else "validation",
+                        "original_stem": json_path.stem,
+                        "orig_image_relative_path": safe_relative(raw_root, image_path),
+                        "orig_json_relative_path": safe_relative(raw_root, json_path),
+                        "source_image_sha256": sha256_file(image_path),
+                        "source_json_sha256": sha256_file(json_path),
+                        "capture_quality": quality,
+                        "failure_case": cases[modality] if quality == "FAIL" else "",
+                        "failure_segment_id": f"quick-{modality}" if quality == "FAIL" else "",
+                        "base_augmentation_names": json.dumps(["brightness_contrast_gamma"]),
+                        "normal_augmentation_parameters": json.dumps({"brightness": 1.02, "contrast": 1.01, "gamma": 0.99, "noise_sigma": 0.003}),
+                        "normal_augmentation_seed": seed,
+                        "slice_seed": stable_seed(seed, parsed.axis, parsed.original_index),
+                        "item_seed": stable_seed(seed, "failure"),
+                        "global_seed": 20260723,
+                    })
     smoke_plan.parent.mkdir(parents=True, exist_ok=True)
     with smoke_plan.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -163,7 +172,9 @@ def write_quick_smoke_plan(raw_root: Path, smoke_plan: Path, per_group: int) -> 
     LOGGER.info("[smoke 3/7] Quick plan written: %s (%d rows)", smoke_plan, len(rows))
     counts: dict[str, int] = defaultdict(int)
     for row in rows:
-        counts[f"{row['modality']}_{row['capture_set']}_{row['capture_quality']}"] += 1
+        counts[
+            f"{row['modality']}_{row['product_status']}_{row['capture_set']}_{row['capture_quality']}"
+        ] += 1
     counts["total"] = len(rows)
     return dict(counts)
 
@@ -172,16 +183,17 @@ def select_smoke_rows(rows: list[dict[str, str]], per_group: int) -> list[dict[s
     """Select every important generation route instead of the first N plan rows."""
     if per_group < 1:
         raise ValueError("per_group must be at least 1")
-    grouped: dict[tuple[str, str, str], list[dict[str, str]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
         capture_set = row["capture_set"]
         quality = row["capture_quality"]
         if capture_set == "recapture":
             quality = "PASS"
-        grouped[(row["modality"], capture_set, quality)].append(row)
+        grouped[(row["modality"], row["product_status"], capture_set, quality)].append(row)
     required = [
-        (modality, capture_set, quality)
+        (modality, product_status, capture_set, quality)
         for modality in ("CT", "RGB")
+        for product_status in ("normal", "defective")
         for capture_set, quality in (
             ("initial_capture", "PASS"),
             ("initial_capture", "FAIL"),
@@ -218,7 +230,9 @@ def write_smoke_plan(source_plan: Path, smoke_plan: Path, per_group: int) -> dic
         writer.writerows(selected)
     counts: dict[str, int] = defaultdict(int)
     for row in selected:
-        counts[f"{row['modality']}_{row['capture_set']}_{row['capture_quality']}"] += 1
+        counts[
+            f"{row['modality']}_{row['product_status']}_{row['capture_set']}_{row['capture_quality']}"
+        ] += 1
     counts["total"] = len(selected)
     LOGGER.info("[smoke 3/7] Stratified smoke plan written: %s (%d rows)", smoke_plan, len(selected))
     return dict(counts)
@@ -260,7 +274,7 @@ def run_smoke_test(
             plan_reused = False
             route_counts = write_quick_smoke_plan(raw_root, smoke_plan, per_group)
             mode = "quick-no-full-scan"
-        LOGGER.info("Smoke plan ready: %d samples across six required routes", route_counts["total"])
+        LOGGER.info("Smoke plan ready: %d samples across 12 required routes", route_counts["total"])
         LOGGER.info("[smoke 4/7] Loading failure engine and generating smoke artifacts")
         generation = generate(raw_root, smoke_plan, output / "dataset", engine_root)
         LOGGER.info("[smoke 4/7] Generation complete: %s", generation)

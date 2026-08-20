@@ -73,7 +73,7 @@ class PipelineTests(unittest.TestCase):
                 "synthetic_id": "initial_CT_1900000001_x_000001",
                 "capture_group_id": "G1", "retry_of_sample_id": "", "capture_set": "initial_capture",
                 "modality": "CT", "original_battery_id": 101, "output_battery_id": 1900000001,
-                "product_status": "normal", "axis": "x", "original_index": 1,
+                "product_status": "defective", "axis": "x", "original_index": 1,
                 "source_sequence_order": 0, "output_sequence_order": 0,
                 "index_gap_before": 0, "index_gap_size": 0,
                 "source_split": "training", "original_stem": image_path.stem,
@@ -103,6 +103,11 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(produced[0]["generator_version"], __version__)
             self.assertTrue(produced[0]["plan_sha256"])
             self.assertIn(produced[0]["jpeg_profile_id"], {"source-qtable", "common-q95-s444"})
+            augmentation = json.loads(
+                (output / produced[0]["augmentation_json_path"]).read_text(encoding="utf-8")
+            )
+            self.assertTrue(augmentation["applied_augmentations"])
+            self.assertEqual(augmentation["failure_case"], "")
             output_image = next((output / "initial_capture" / "CT" / "images").glob("*.jpg"))
             with Image.open(output_image) as generated:
                 self.assertEqual(generated.size, (8, 12))

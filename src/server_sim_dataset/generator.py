@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, JpegImagePlugin
 
 from . import __version__
+from .planner import FAILURE_CASES, INITIAL_QUANTITIES, RECAPTURE_QUANTITIES
 from .schema import (
     MANIFEST_COLUMNS,
     ct_axis_transform,
@@ -544,31 +545,66 @@ def _generate_one(task: tuple[Any, ...]) -> tuple[dict[str, Any], int, int]:
     retries = 0
     if row["failure_case"]:
         engine = _engine_for(engine_root)
-        outcome = _apply_failure(engine, rendered, row)
-        if outcome is None:
-            # 계획서 7.5: 8 회 모두 실패한 뒤에만 다음 reserve 소스로 이동한다.
-            for candidate in json.loads(row.get("reserve_candidates") or "[]"):
-                rendered = _render(raw_root, row, candidate, strict_source_hash=strict_source_hash)
-                outcome = _apply_failure(engine, rendered, row)
-                if outcome is not None:
+        planned_failure_case = row["failure_case"]
+        fallback_cases = sorted(
+            (case for case in FAILURE_CASES[modality] if case != planned_failure_case),
+            key=lambda case: stable_seed(row["item_seed"], "failure-case-fallback", case),
+        )
+        applied_failure_case = planned_failure_case
+        outcome = None
+        primary_rendered = rendered
+        reserve_candidates = json.loads(row.get("reserve_candidates") or "[]")
+        for failure_case in (planned_failure_case, *fallback_cases):
+            attempt_row = dict(row, failure_case=failure_case)
+            for candidate in (None, *reserve_candidates):
+                rendered = (
+                    primary_rendered if candidate is None
+                    else _render(raw_root, row, candidate, strict_source_hash=strict_source_hash)
+                )
+                outcome = _apply_failure(engine, rendered, attempt_row)
+                if outcome is None:
+                    retries += _FAILURE_ATTEMPTS
+                    continue
+                retries += outcome["attempt"]
+                applied_failure_case = failure_case
+                if candidate is not None:
                     used_reserve = candidate
                     reserve_hit = 1
-                    payload = rendered.payload
-                    normal_base_pixel_hash = _pixel_hash(rendered.image)
                     LOGGER.info(
                         "Reserve rank %s used for %s (%s)",
                         candidate["rank"], row["sample_id"], candidate["reason"],
                     )
-                    break
-            if outcome is None:
-                raise RuntimeError(f"FAIL quality gate exhausted every reserve for {row['sample_id']}")
-        retries = outcome["attempt"]
+                if failure_case != planned_failure_case:
+                    LOGGER.warning(
+                        "Failure case fallback for %s: %s -> %s",
+                        row["sample_id"], planned_failure_case, failure_case,
+                    )
+                payload = rendered.payload
+                normal = rendered.normal
+                augmentation.update({
+                    "applied_augmentations": normal.applied,
+                    "retry_reason": normal.retry_reason,
+                    "flip": {
+                        "x": normal.flip_horizontal,
+                        "y": normal.flip_vertical,
+                        "horizontal": normal.flip_horizontal,
+                        "vertical": normal.flip_vertical,
+                    },
+                })
+                normal_base_pixel_hash = _pixel_hash(rendered.image)
+                break
+            if outcome is not None:
+                break
+        if outcome is None:
+            raise RuntimeError(f"FAIL quality gate exhausted every reserve and fallback case for {row['sample_id']}")
         result = outcome["result"]
         defects = outcome["defects"]
         image = result.image
         width, height = outcome["width"], outcome["height"]
         augmentation.update({
-            "failure_case": row["failure_case"],
+            "failure_case": applied_failure_case,
+            "planned_failure_case": planned_failure_case,
+            "applied_failure_case": applied_failure_case,
             "failure_attempt": outcome["attempt"],
             "transforms": result.records,
             "severity": max((record.get("severity", 0.0) for record in result.records), default=0.0),
@@ -614,10 +650,14 @@ def _generate_one(task: tuple[Any, ...]) -> tuple[dict[str, Any], int, int]:
     checks = augmentation["automatic_checks"]
     transforms = augmentation.get("transforms", [])
     result_row = dict(row)
+    retry_reasons = [reason for reason in (normal.retry_reason,) if reason]
+    if row["failure_case"] and applied_failure_case != planned_failure_case:
+        retry_reasons.append(f"failure_case_fallback:{planned_failure_case}->{applied_failure_case}")
     result_row.update({
         "generation_status": "success",
         "jpeg_profile_id": jpeg_profile,
-        "exclusion_or_retry_reason": normal.retry_reason,
+        "exclusion_or_retry_reason": ";".join(retry_reasons),
+        "failure_case": applied_failure_case if row["failure_case"] else "",
         "generator_version": __version__,
         "plan_sha256": plan_hash,
         "pixel_hash": _pixel_hash(image),
@@ -741,8 +781,8 @@ def generate(
 
 
 EXPECTED_QUANTITIES = {
-    ("initial_capture", "CT"): 29000, ("initial_capture", "RGB"): 5000,
-    ("recapture", "CT"): 2900, ("recapture", "RGB"): 500,
+    **{("initial_capture", modality): count for modality, count in INITIAL_QUANTITIES.items()},
+    **{("recapture", modality): count for modality, count in RECAPTURE_QUANTITIES.items()},
 }
 
 

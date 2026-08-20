@@ -55,7 +55,8 @@ class PlannerFixture(unittest.TestCase):
 class QuantityTests(PlannerFixture):
     def test_v15_configuration_records_id_targets_and_ct_coordinates(self) -> None:
         settings = planner._configuration(planner.GLOBAL_SEED)
-        self.assertEqual(settings["defective_id_counts"], {"CT": 1, "RGB": 2})
+        self.assertEqual(settings["defective_id_counts"], {"CT": 2, "RGB": 4})
+        self.assertEqual(settings["failure_id_counts"], {"CT": 4, "RGB": 4})
         self.assertEqual(
             settings["ct_axis_coordinates"],
             {"x": ("X", "Y", "Z"), "y": ("Y", "X", "Z"), "z": ("Z", "X", "Y")},
@@ -63,32 +64,30 @@ class QuantityTests(PlannerFixture):
 
     def test_plan_quantities_match_section_13_1(self) -> None:
         counts = Counter(row["capture_set"] for row in self.plan_rows)
-        self.assertEqual(counts["initial_capture"], 34000)
-        self.assertEqual(counts["recapture"], 3400)
-        self.assertEqual(len(self.plan_rows), 37400)
+        self.assertEqual(counts["initial_capture"], 68000)
+        self.assertEqual(counts["recapture"], 6800)
+        self.assertEqual(len(self.plan_rows), 74800)
 
     def test_output_battery_id_ranges_are_disjoint(self) -> None:
         ct = {int(row["output_battery_id"]) for row in self.plan_rows if row["modality"] == "CT"}
         rgb = {int(row["output_battery_id"]) for row in self.plan_rows if row["modality"] == "RGB"}
-        self.assertEqual(ct, set(range(1_900_000_001, 1_900_000_021)))
-        self.assertEqual(rgb, set(range(2_900_000_001, 2_900_000_021)))
+        self.assertEqual(ct, set(range(1_900_000_001, 1_900_000_041)))
+        self.assertEqual(rgb, set(range(2_900_000_001, 2_900_000_041)))
         self.assertEqual(ct & rgb, set())
 
-    def test_ct_uses_one_defective_and_nineteen_normal_ids(self) -> None:
+    def test_ct_uses_two_defective_and_thirty_eight_normal_ids(self) -> None:
         """계획서 v1.5 §4.1: CT 제품 상태를 ID 개수로 고정한다."""
         ids = [row for row in self.selected_rows if row["modality"] == "CT"]
-        self.assertEqual(len(ids), 20)
-        self.assertEqual(Counter(row["stratum"] for row in ids), Counter({"zero": 19, "low_mid": 1}))
-        self.assertEqual(sum(1 for row in ids if row["product_status"] == "defective"), 1)
+        self.assertEqual(len(ids), 40)
+        self.assertEqual(sum(1 for row in ids if row["product_status"] == "defective"), 2)
 
-    def test_rgb_selects_one_pollution_carrier_and_one_damaged_carrier(self) -> None:
+    def test_rgb_defective_ids_cover_pollution_and_damaged_roles(self) -> None:
         defective = [
             row for row in self.selected_rows
             if row["modality"] == "RGB" and row["product_status"] == "defective"
         ]
-        self.assertEqual(len(defective), 2)
+        self.assertEqual(len(defective), 4)
         self.assertEqual({row["defect_role"] for row in defective}, {"pollution", "damaged"})
-        self.assertEqual(len({row["original_battery_id"] for row in defective}), 2)
         for selected in defective:
             flag = "has_pollution" if selected["defect_role"] == "pollution" else "has_damaged"
             rows = [
@@ -98,18 +97,18 @@ class QuantityTests(PlannerFixture):
             ]
             self.assertTrue(any(row[flag] == "1" for row in rows))
 
-    def test_rgb_uses_two_defective_output_ids(self) -> None:
+    def test_modalities_use_configured_defective_output_counts(self) -> None:
         counts = Counter(
             (row["modality"], row["product_status"])
             for row in self.selected_rows
         )
-        self.assertEqual(counts[("CT", "defective")], 1)
-        self.assertEqual(counts[("CT", "normal")], 19)
-        self.assertEqual(counts[("RGB", "defective")], 2)
-        self.assertEqual(counts[("RGB", "normal")], 18)
+        self.assertEqual(counts[("CT", "defective")], 2)
+        self.assertEqual(counts[("CT", "normal")], 38)
+        self.assertEqual(counts[("RGB", "defective")], 4)
+        self.assertEqual(counts[("RGB", "normal")], 36)
 
     def test_capture_quality_is_stratified_across_product_status(self) -> None:
-        """계획서 v1.5 §7: FAIL 대상을 제품 상태별로 하나씩 고른다.
+        """FAIL 대상을 제품 상태별로 배분해 모든 상태×품질 조합을 만든다.
 
         v1.3 산출물에는 촬영실패이면서 제품불량인 이미지가 한 장도 없었다. 두 축이
         독립이라고 규정해 놓고 교차 칸이 비면 그 조합을 학습에도 평가에도 쓸 수 없다.
@@ -126,15 +125,33 @@ class QuantityTests(PlannerFixture):
                         f"{modality} {quality}/{'불량' if defective else '정상'} 칸이 비었다",
                     )
 
+    def test_each_output_id_has_the_required_initial_and_recapture_images(self) -> None:
+        per_id = {"CT": 1450, "RGB": 250}
+        for modality, expected in per_id.items():
+            initial = Counter(
+                row["output_battery_id"]
+                for row in self.plan_rows
+                if row["modality"] == modality and row["capture_set"] == "initial_capture"
+            )
+            recapture = Counter(
+                row["output_battery_id"]
+                for row in self.plan_rows
+                if row["modality"] == modality and row["capture_set"] == "recapture"
+            )
+            self.assertEqual(len(initial), 40, modality)
+            self.assertEqual(set(initial.values()), {expected}, modality)
+            self.assertEqual(len(recapture), 4, modality)
+            self.assertEqual(set(recapture.values()), {expected}, modality)
+
 class SelectionTests(PlannerFixture):
-    def test_ct_reuses_normal_sources_to_fill_nineteen_output_ids(self) -> None:
+    def test_ct_reuses_normal_sources_to_fill_thirty_eight_output_ids(self) -> None:
         normal = [
             row for row in self.selected_rows
             if row["modality"] == "CT" and row["product_status"] == "normal"
         ]
-        self.assertEqual(len(normal), 19)
+        self.assertEqual(len(normal), 38)
         self.assertEqual(len({row["original_battery_id"] for row in normal}), len(CT_NORMAL_IDS))
-        self.assertEqual(len({row["output_battery_id"] for row in normal}), 19)
+        self.assertEqual(len({row["output_battery_id"] for row in normal}), 38)
         self.assertTrue(any(int(row["source_reuse_total"]) > 1 for row in normal))
 
         initial = [
@@ -154,7 +171,7 @@ class SelectionTests(PlannerFixture):
                 row["base_augmentation_names"],
                 row["normal_augmentation_parameters"],
             ))
-        self.assertEqual(len(set(seeds_by_output.values())), 19)
+        self.assertEqual(len(set(seeds_by_output.values())), 38)
         self.assertEqual(sum(len(groups) for groups in groups_by_output.values()), len(initial))
         for source_id, signatures in signatures_by_source.items():
             output_count = len({
@@ -234,7 +251,7 @@ class SelectionTests(PlannerFixture):
             and row["product_status"] == "defective"
             and row["capture_set"] == "initial_capture"
         ]
-        self.assertEqual(len(defective), 1450)
+        self.assertEqual(len(defective), 2 * 1450)
         self.assertEqual(int(defective[0]["original_battery_id"]), CT_DEFECT_ID)
         self.assertIn(
             "has_porosity",
@@ -275,6 +292,20 @@ class SelectionTests(PlannerFixture):
 
 
 class AugmentationAssignmentTests(PlannerFixture):
+    def test_defective_pass_images_receive_normal_capture_augmentation(self) -> None:
+        """제품불량이어도 촬영 PASS면 정상촬영 기본 증강을 반드시 적용한다."""
+        rows = [
+            row for row in self.plan_rows
+            if row["capture_set"] == "initial_capture"
+            and row["product_status"] == "defective"
+            and row["capture_quality"] == "PASS"
+        ]
+        self.assertTrue(rows)
+        self.assertTrue(all(json.loads(row["base_augmentation_names"]) for row in rows))
+        self.assertTrue(all(row["normal_augmentation_seed"] for row in rows))
+        self.assertTrue(all(json.loads(row["normal_augmentation_parameters"]) for row in rows))
+        self.assertTrue(all(row["failure_case"] == "" for row in rows))
+
     def test_single_and_double_ratio_is_80_20(self) -> None:
         """계획서 6.1: 단일 정상 증강 80%, 2 개 조합 20%."""
         for modality in ("CT", "RGB"):
@@ -345,14 +376,44 @@ class ReserveTests(PlannerFixture):
 
     def test_reserve_does_not_reuse_the_primary_failure_slots(self) -> None:
         """계획서 7.5: reserve 는 주 FAIL 구간과 겹치지 않는 대체 구간이어야 한다."""
-        primary = {
-            row["original_stem"] for row in self.plan_rows
-            if row["failure_case"] and row["capture_set"] == "initial_capture"
-        }
+        primary_by_output = defaultdict(set)
+        for row in self.plan_rows:
+            if row["failure_case"] and row["capture_set"] == "initial_capture":
+                primary_by_output[(row["modality"], row["output_battery_id"])].add(row["original_stem"])
         for row in self.plan_rows:
             for item in json.loads(row["reserve_candidates"] or "[]"):
                 if item["reason"] == "same-axis":
-                    self.assertNotIn(item["original_stem"], primary)
+                    self.assertNotIn(
+                        item["original_stem"],
+                        primary_by_output[(row["modality"], row["output_battery_id"])],
+                    )
+
+    def test_fail_targets_are_balanced_across_product_status(self) -> None:
+        """각 모달리티의 FAIL ID 4개는 제품불량 2개와 정상 2개로 구성한다."""
+        for modality in ("CT", "RGB"):
+            targets = [
+                row for row in self.selected_rows
+                if row["modality"] == modality and row["fail_target"] == "True"
+            ]
+            self.assertEqual(
+                Counter(row["product_status"] for row in targets),
+                Counter({"defective": 2, "normal": 2}),
+            )
+
+    def test_fail_and_recapture_target_exactly_four_ids_per_modality(self) -> None:
+        for modality, images_per_id in (("CT", 1450), ("RGB", 250)):
+            initial_fail_ids = {
+                row["output_battery_id"] for row in self.plan_rows
+                if row["modality"] == modality and row["capture_set"] == "initial_capture"
+                and row["capture_quality"] == "FAIL"
+            }
+            recapture = [
+                row for row in self.plan_rows
+                if row["modality"] == modality and row["capture_set"] == "recapture"
+            ]
+            self.assertEqual(len(initial_fail_ids), 4)
+            self.assertEqual(len(recapture), 4 * images_per_id)
+            self.assertEqual({row["capture_quality"] for row in recapture}, {"PASS"})
 
     def test_fail_window_length_is_between_10_and_25(self) -> None:
         """계획서 7.3: FAIL 구간 길이 L 은 10~25 이다."""

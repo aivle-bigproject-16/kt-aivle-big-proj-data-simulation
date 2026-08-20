@@ -13,6 +13,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from server_sim_dataset.planner import DEFECTIVE_ID_COUNTS, SELECTED_IDS
+
 
 CT_RE = re.compile(r"^CT_cell_(?P<form>[^_]+)_(?P<id>\d+)_(?P<axis>[xyz])_(?P<index>\d+)$")
 RGB_RE = re.compile(r"^RGB_cell_(?P<form>[^_]+)_(?P<id>\d+)_(?P<index>\d+)$")
@@ -188,23 +190,27 @@ def main() -> int:
             "defective_candidate_count": len(ct_defective),
             "normal_candidate_ids": sorted(ct_normal),
             "defective_candidate_ids": sorted(ct_defective),
-            "required_normal_ids": 19,
-            "required_defective_ids": 1,
+            "required_normal_output_ids": SELECTED_IDS - DEFECTIVE_ID_COUNTS["CT"],
+            "required_defective_output_ids": DEFECTIVE_ID_COUNTS["CT"],
+            "source_reuse_allowed": True,
         },
         "RGB": {
             "normal_candidate_count": len(rgb_normal),
             "defective_candidate_count": len(rgb_defective),
             "normal_candidate_ids": rgb_normal,
             "defective_candidate_ids": rgb_defective,
-            "required_normal_ids": 19,
-            "required_defective_ids": 1,
+            "required_normal_output_ids": SELECTED_IDS - DEFECTIVE_ID_COUNTS["RGB"],
+            "required_defective_output_ids": DEFECTIVE_ID_COUNTS["RGB"],
+            "source_reuse_allowed": True,
         },
-        "output_id_ranges_disjoint": set(range(1900000001, 1900000021)).isdisjoint(range(2900000001, 2900000021)),
+        "output_id_ranges_disjoint": set(range(1_900_000_001, 1_900_000_001 + SELECTED_IDS)).isdisjoint(
+            range(2_900_000_001, 2_900_000_001 + SELECTED_IDS)
+        ),
     }
     report["plan_feasible"] = (
-        len(ct_normal) >= 19
+        len(ct_normal) >= 1
         and len(ct_defective) >= 1
-        and len(rgb_normal) >= 19
+        and len(rgb_normal) >= 1
         and len(rgb_defective) >= 1
         and not malformed_stems
         and not schema_errors
